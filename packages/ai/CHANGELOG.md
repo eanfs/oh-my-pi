@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added Volcengine Coding Plan (火山引擎) provider (`volcengine-coding-plan`), a multi-vendor coding gateway (Doubao, MiniMax, GLM, DeepSeek, Kimi) via `VOLCENGINE_API_KEY`. OpenAI-compatible endpoint at `https://ark.cn-beijing.volces.com/api/coding/v3`; thinking uses binary `params.thinking.type` via `"zai"` format. `/login volcengine-coding-plan` paste-and-validate flow. The stream idle watchdog is widened to 600s for the whole gateway, since its reasoning models buffer silently during the thinking phase and would otherwise trip the default 120s timeout with `OpenAI completions stream stalled while waiting for the next event`.
+
 ## [15.6.0] - 2026-05-30
 
 ### Fixed

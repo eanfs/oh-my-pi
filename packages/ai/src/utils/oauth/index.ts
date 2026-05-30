@@ -88,6 +88,11 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 		available: true,
 	},
 	{
+		id: "volcengine-coding-plan",
+		name: "Volcengine Coding Plan (火山引擎)",
+		available: true,
+	},
+	{
 		id: "minimax-code",
 		name: "MiniMax Coding Plan (International)",
 		available: true,

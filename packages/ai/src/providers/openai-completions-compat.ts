@@ -66,6 +66,10 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		/(^|\/)claude[-.]/i.test(model.id) ||
 		/(^|\/)anthropic\//i.test(model.id);
 	const isAlibaba = provider === "alibaba-coding-plan" || baseUrl.includes("dashscope");
+	const isVolcengine =
+		provider === "volcengine-coding-plan" ||
+		baseUrl.includes("ark.cn-beijing.volces.com") ||
+		baseUrl.includes("ark.volces.com");
 	const isQwen = model.id.toLowerCase().includes("qwen");
 	// DeepSeek V4 (and other reasoning-capable DeepSeek models) reject follow-up requests in
 	// thinking mode unless prior assistant tool-call turns include `reasoning_content`. The
@@ -96,6 +100,7 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		baseUrl.includes("chutes.ai") ||
 		baseUrl.includes("deepseek.com") ||
 		baseUrl.includes("fireworks.ai") ||
+		isVolcengine ||
 		isAlibaba ||
 		isZai ||
 		isZhipu ||
@@ -197,7 +202,7 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		// OpenAI's reasoning-API surface.
 		supportsDeveloperRole: isOpenAIHost || isAzureHost,
 		supportsMultipleSystemMessages: supportsMultipleSystemMessagesDefault,
-		supportsReasoningEffort: !isGrok && !isZai && !isZhipu,
+		supportsReasoningEffort: !isGrok && !isZai && !isZhipu && !isVolcengine,
 		reasoningEffortMap,
 		supportsUsageInStreaming: !isCerebras,
 		disableReasoningOnForcedToolChoice: isKimiModel || isAnthropicModel,
@@ -214,7 +219,7 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		// etc. — drives reasoning via OpenAI-style `reasoning_effort`
 		// (low|medium|high|xhigh|max|none), so those stay on the "openai" path.
 		thinkingFormat:
-			isZai || isZhipu || isMoonshotKimi
+			isZai || isZhipu || isMoonshotKimi || isVolcengine
 				? "zai"
 				: provider === "openrouter" || baseUrl.includes("openrouter.ai")
 					? "openrouter"

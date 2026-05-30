@@ -382,20 +382,28 @@ function getTrailingPartialDeepseekToken(text: string): string {
 const OPENAI_COMPLETIONS_FIRST_EVENT_TIMEOUT_MESSAGE =
 	"OpenAI completions stream timed out while waiting for the first event";
 
-const GLM_CODING_PLAN_STREAM_IDLE_TIMEOUT_MS = 600_000;
+const SLOW_CODING_PLAN_STREAM_IDLE_TIMEOUT_MS = 600_000;
 const GLM_CODING_PLAN_MODEL_PATTERN = /^glm-5(?:[.-]|$)/i;
 
-/** Returns the widened OpenAI stream watchdog floor for slow GLM coding-plan reasoning models. */
+/** Returns the widened OpenAI stream watchdog floor for slow coding-plan reasoning models. */
 export function getOpenAICompletionsStreamIdleTimeoutFallbackMs(
 	model: Model<"openai-completions">,
 ): number | undefined {
+	const baseUrl = model.baseUrl.toLowerCase();
+
+	// Volcengine Ark coding-plan is a multi-vendor gateway of slow reasoning
+	// models (Doubao, DeepSeek, Kimi, MiniMax, GLM) that buffer silently during
+	// the thinking phase, so widen the whole gateway rather than just GLM ids.
+	if (model.provider === "volcengine-coding-plan" || baseUrl.includes("ark.cn-beijing.volces.com")) {
+		return SLOW_CODING_PLAN_STREAM_IDLE_TIMEOUT_MS;
+	}
+
 	if (!GLM_CODING_PLAN_MODEL_PATTERN.test(model.id)) return undefined;
 	if (model.provider === "zhipu-coding-plan" || model.provider === "zai")
-		return GLM_CODING_PLAN_STREAM_IDLE_TIMEOUT_MS;
+		return SLOW_CODING_PLAN_STREAM_IDLE_TIMEOUT_MS;
 
-	const baseUrl = model.baseUrl.toLowerCase();
 	if (baseUrl.includes("open.bigmodel.cn") || baseUrl.includes("api.z.ai")) {
-		return GLM_CODING_PLAN_STREAM_IDLE_TIMEOUT_MS;
+		return SLOW_CODING_PLAN_STREAM_IDLE_TIMEOUT_MS;
 	}
 
 	return undefined;

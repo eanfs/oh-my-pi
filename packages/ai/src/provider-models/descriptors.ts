@@ -45,6 +45,7 @@ import {
 	xaiOAuthModelManagerOptions,
 	xiaomiModelManagerOptions,
 	zenmuxModelManagerOptions,
+	volcengineCodingPlanModelManagerOptions,
 	zhipuCodingPlanModelManagerOptions,
 } from "./openai-compat";
 import { cursorModelManagerOptions, zaiModelManagerOptions } from "./special";
@@ -324,6 +325,12 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		"glm-5.1",
 		config => zhipuCodingPlanModelManagerOptions(config),
 		catalog("Zhipu Coding Plan", ["ZHIPU_API_KEY"]),
+	),
+	catalogDescriptor(
+		"volcengine-coding-plan",
+		"doubao-seed-2.0-pro",
+		config => volcengineCodingPlanModelManagerOptions(config),
+		catalog("Volcengine Coding Plan (火山引擎)", ["VOLCENGINE_API_KEY"]),
 	),
 	descriptor("github-copilot", "gpt-4o", config => githubCopilotModelManagerOptions(config)),
 	descriptor("google", "gemini-2.5-pro", config => googleModelManagerOptions(config)),

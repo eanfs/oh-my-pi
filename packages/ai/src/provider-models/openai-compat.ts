@@ -1564,6 +1564,42 @@ export function alibabaCodingPlanModelManagerOptions(
 }
 
 // ---------------------------------------------------------------------------
+// Volcengine Coding Plan (火山引擎)
+// ---------------------------------------------------------------------------
+
+export interface VolcengineCodingPlanModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+}
+
+export function volcengineCodingPlanModelManagerOptions(
+	config?: VolcengineCodingPlanModelManagerConfig,
+): ModelManagerOptions<"openai-completions"> {
+	const apiKey = config?.apiKey;
+	const baseUrl = config?.baseUrl ?? "https://ark.cn-beijing.volces.com/api/coding/v3";
+	const references = createBundledReferenceMap<"openai-completions">("volcengine-coding-plan");
+	return {
+		providerId: "volcengine-coding-plan",
+		fetchDynamicModels: () =>
+			fetchOpenAICompatibleModels({
+				api: "openai-completions",
+				provider: "volcengine-coding-plan",
+				baseUrl,
+				apiKey,
+				// Multi-vendor gateway (Doubao, MiniMax, GLM, DeepSeek, Kimi) — reasoning
+				// and vision flags vary per vendor, so rely on the bundled reference /
+				// models.dev defaults rather than id heuristics. zai thinking format and
+				// `supportsDeveloperRole: false` come from the runtime `isVolcengine`
+				// detection in detectOpenAICompat.
+				mapModel: (entry, defaults) => {
+					const reference = references.get(defaults.id);
+					return mapWithBundledReference(entry, defaults, reference);
+				},
+			}),
+	};
+}
+
+// ---------------------------------------------------------------------------
 // 11. Vercel AI Gateway
 // ---------------------------------------------------------------------------
 
@@ -2710,6 +2746,19 @@ const MODELS_DEV_PROVIDER_DESCRIPTORS_CODING_PLANS: readonly ModelsDevProviderDe
 		"zhipu-coding-plan",
 		"zhipu-coding-plan",
 		"https://open.bigmodel.cn/api/coding/paas/v4",
+		{
+			compat: {
+				thinkingFormat: "zai",
+				reasoningContentField: "reasoning_content",
+				supportsDeveloperRole: false,
+			},
+		},
+	),
+	// --- Volcengine Coding Plan ---
+	openAiCompletionsDescriptor(
+		"volcengine-coding-plan",
+		"volcengine-coding-plan",
+		"https://ark.cn-beijing.volces.com/api/coding/v3",
 		{
 			compat: {
 				thinkingFormat: "zai",

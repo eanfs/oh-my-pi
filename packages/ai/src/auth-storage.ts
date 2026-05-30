@@ -1643,6 +1643,12 @@ export class AuthStorage {
 				await saveApiKeyCredential(apiKey);
 				return;
 			}
+			case "volcengine-coding-plan": {
+				const { loginVolcengineCodingPlan } = await import("./utils/oauth/volcengine");
+				const apiKey = await loginVolcengineCodingPlan(ctrl);
+				await saveApiKeyCredential(apiKey);
+				return;
+			}
 			case "qianfan": {
 				const { loginQianfan } = await import("./utils/oauth/qianfan");
 				const apiKey = await loginQianfan(ctrl);

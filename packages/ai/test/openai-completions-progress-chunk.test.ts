@@ -108,6 +108,33 @@ describe("getOpenAICompletionsStreamIdleTimeoutFallbackMs", () => {
 		expect(getOpenAICompletionsStreamIdleTimeoutFallbackMs(model)).toBe(600_000);
 	});
 
+	it("widens the Volcengine coding-plan gateway for all reasoning models", () => {
+		const model = {
+			...openAICompletionsModel,
+			id: "deepseek-v4-pro",
+			name: "DeepSeek-V4-Pro",
+			provider: "volcengine-coding-plan",
+			baseUrl: "https://ark.cn-beijing.volces.com/api/coding/v3",
+		} satisfies Model<"openai-completions">;
+
+		// Non-GLM model on the gateway must still get the widened floor: the whole
+		// gateway serves slow reasoning models (DeepSeek, Kimi, MiniMax, Doubao)
+		// that go silent during the thinking phase and trip the 120s default.
+		expect(getOpenAICompletionsStreamIdleTimeoutFallbackMs(model)).toBe(600_000);
+	});
+
+	it("also widens custom Volcengine Ark OpenAI-compatible endpoints by baseUrl", () => {
+		const model = {
+			...openAICompletionsModel,
+			id: "doubao-seed-2.0-pro",
+			name: "Doubao-Seed-2.0-Pro",
+			provider: "openai",
+			baseUrl: "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions",
+		} satisfies Model<"openai-completions">;
+
+		expect(getOpenAICompletionsStreamIdleTimeoutFallbackMs(model)).toBe(600_000);
+	});
+
 	it("keeps ordinary OpenAI-compatible models on the global timeout", () => {
 		expect(getOpenAICompletionsStreamIdleTimeoutFallbackMs(openAICompletionsModel)).toBeUndefined();
 	});
