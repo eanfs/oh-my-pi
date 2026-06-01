@@ -10,8 +10,10 @@ import type { Skill } from "../extensibility/skills";
 import type { GoalModeState, GoalRuntime } from "../goals";
 import { GoalTool } from "../goals/tools/goal-tool";
 import type { HindsightSessionState } from "../hindsight/state";
+import type { LocalProtocolOptions } from "../internal-urls";
 import { LspTool } from "../lsp";
-import type { MnemosyneSessionState } from "../mnemosyne/state";
+import type { MCPManager } from "../mcp";
+import type { MnemopiSessionState } from "../mnemopi/state";
 import type { PlanModeState } from "../plan-mode/state";
 import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { ArtifactManager } from "../session/artifacts";
@@ -153,8 +155,8 @@ export interface ToolSession {
 	getSessionId?: () => string | null;
 	/** Get Hindsight runtime state for this agent session. */
 	getHindsightSessionState?: () => HindsightSessionState | undefined;
-	/** Get Mnemosyne runtime state for this agent session. */
-	getMnemosyneSessionState?: () => MnemosyneSessionState | undefined;
+	/** Get Mnemopi runtime state for this agent session. */
+	getMnemopiSessionState?: () => MnemopiSessionState | undefined;
 	/** Agent identity used for IRC routing. Returns the registry id (e.g. "0-Main", "0-AuthLoader"). */
 	getAgentId?: () => string | null;
 	/** Look up a registered tool by name (used by the eval js backend's tool bridge). */
@@ -179,6 +181,10 @@ export interface ToolSession {
 	modelRegistry?: import("../config/model-registry").ModelRegistry;
 	/** Agent output manager for unique agent:// IDs across task invocations */
 	agentOutputManager?: AgentOutputManager;
+	/** MCP manager visible to subagents without relying on the process-global singleton. */
+	mcpManager?: MCPManager;
+	/** Local protocol root to propagate to nested subagents and eval-created agents. */
+	localProtocolOptions?: LocalProtocolOptions;
 	/** Settings instance for passing to subagents */
 	settings: Settings;
 	/** Plan mode state (if active) */
@@ -187,6 +193,12 @@ export interface ToolSession {
 	getGoalModeState?: () => GoalModeState | undefined;
 	/** Goal runtime for the active agent session. */
 	getGoalRuntime?: () => GoalRuntime | undefined;
+	/** Get cumulative session usage statistics (input/output tokens, cost). */
+	getUsageStatistics?: () => import("../session/session-manager").UsageStatistics;
+	/** Current per-turn token budget {total, spent, hard} for the eval `budget` helper. */
+	getTurnBudget?: () => { total: number | null; spent: number; hard: boolean };
+	/** Record output tokens consumed by an eval-spawned subagent toward the current turn budget. */
+	recordEvalSubagentUsage?: (output: number) => void;
 	/** Bridge to the connected client (e.g. ACP editor host). Tools should route fs/terminal/permission requests through this when available. */
 	getClientBridge?: () => ClientBridge | undefined;
 	/** Get compact conversation context for subagents (excludes tool results, system prompts) */
@@ -413,7 +425,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		) {
 			requestedTools.push("ast_edit");
 		}
-		if (["hindsight", "mnemosyne"].includes(session.settings.get("memory.backend") ?? "")) {
+		if (["hindsight", "mnemopi"].includes(session.settings.get("memory.backend") ?? "")) {
 			for (const name of ["recall", "retain", "reflect"]) {
 				if (!requestedTools.includes(name)) requestedTools.push(name);
 			}
@@ -458,7 +470,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 			return true;
 		}
 		if (name === "retain" || name === "recall" || name === "reflect") {
-			return ["hindsight", "mnemosyne"].includes(session.settings.get("memory.backend") ?? "");
+			return ["hindsight", "mnemopi"].includes(session.settings.get("memory.backend") ?? "");
 		}
 		if (name === "task") {
 			const maxDepth = session.settings.get("task.maxRecursionDepth") ?? 2;

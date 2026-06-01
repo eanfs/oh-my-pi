@@ -62,6 +62,7 @@ import type { AgentSession, AgentSessionEvent, ResolvedRoleModel } from "../sess
 import { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
 import { getRecentSessions } from "../session/session-manager";
+import type { ShakeMode } from "../session/shake-types";
 import { formatDuration } from "../slash-commands/helpers/format";
 import { STTController, type SttState } from "../stt";
 import type { LspStartupServerInfo } from "../tools";
@@ -2040,16 +2041,20 @@ export class InteractiveMode implements InteractiveModeContext {
 				: "Approve and keep context";
 
 		// Model-tier slider: let the operator pick which configured role model
-		// (smol/default/slow/…) executes the approved plan. Left/right move it from
-		// any list position. Hidden when fewer than two role models resolve — a lone
-		// tier is no choice. `selectedTierIndex` tracks the live slider position.
+		// (smol/default/slow/…) executes the approved plan. The slider always starts
+		// on the `default` tier so execution defaults to the default model no matter
+		// which model drove the planning conversation. Left/right move it from there;
+		// hidden when fewer than two role models resolve — a lone tier is no choice.
+		// `selectedTierIndex` tracks the live slider position.
 		const cycle = this.session.getRoleModelCycle(this.session.settings.get("cycleOrder"));
-		let selectedTierIndex = cycle?.currentIndex ?? 0;
+		const defaultTierIndex = cycle ? cycle.models.findIndex(entry => entry.role === "default") : -1;
+		const startTierIndex = defaultTierIndex >= 0 ? defaultTierIndex : (cycle?.currentIndex ?? 0);
+		let selectedTierIndex = startTierIndex;
 		const slider: HookSelectorSlider | undefined =
 			cycle && cycle.models.length > 1
 				? {
 						caption: "continue with",
-						index: cycle.currentIndex,
+						index: startTierIndex,
 						segments: cycle.models.map(entry => ({
 							label: entry.role,
 							color: MODEL_ROLES[entry.role as ModelRole]?.color,
@@ -2086,6 +2091,9 @@ export class InteractiveMode implements InteractiveModeContext {
 				// applying the slider choice any earlier would be silently reverted —
 				// the bug that made "continue with slow" keep executing on the default
 				// model. Deferred application also survives newSession()/compaction.
+				// `cycle.currentIndex` is exactly that restored model, so any chosen tier
+				// differing from it needs an explicit executionModel — this also covers
+				// leaving the slider on its `default` anchor while planning ran elsewhere.
 				const executionModel =
 					cycle && selectedTierIndex !== cycle.currentIndex ? cycle.models[selectedTierIndex] : undefined;
 				await this.#approvePlan(latestPlanContent, {
@@ -2692,6 +2700,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#commandController.handleHandoffCommand(customInstructions);
 	}
 
+	handleShakeCommand(mode: ShakeMode): Promise<void> {
+		return this.#commandController.handleShakeCommand(mode);
+	}
+
 	executeCompaction(
 		customInstructionsOrOptions?: string | CompactOptions,
 		isAuto?: boolean,
@@ -2812,8 +2824,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#inputController.cycleThinkingLevel();
 	}
 
-	cycleRoleModel(options?: { temporary?: boolean }): Promise<void> {
-		return this.#inputController.cycleRoleModel(options);
+	cycleRoleModel(direction?: "forward" | "backward"): Promise<void> {
+		return this.#inputController.cycleRoleModel(direction);
 	}
 
 	toggleToolOutputExpansion(): void {

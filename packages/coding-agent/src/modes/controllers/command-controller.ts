@@ -39,6 +39,7 @@ import { buildToolsMarkdown } from "../../modes/utils/tools-markdown";
 import type { AsyncJobSnapshotItem } from "../../session/agent-session";
 import type { AuthStorage } from "../../session/auth-storage";
 import type { NewSessionOptions } from "../../session/session-manager";
+import { formatShakeSummary, type ShakeMode, type ShakeResult } from "../../session/shake-types";
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd, stripOuterDoubleQuotes } from "../../tools/path-utils";
 import { replaceTabs } from "../../tools/render-utils";
@@ -1120,6 +1121,30 @@ export class CommandController {
 		}
 
 		return this.executeCompaction(customInstructions, false);
+	}
+
+	/**
+	 * TUI handler for `/shake`. `elide` drops heavy structural content and
+	 * `images` strips image blocks. Rebuilds the chat and reports counts.
+	 */
+	async handleShakeCommand(mode: ShakeMode): Promise<void> {
+		let result: ShakeResult;
+		try {
+			result = await this.ctx.session.shake(mode);
+		} catch (error) {
+			this.ctx.showError(`Shake failed: ${error instanceof Error ? error.message : String(error)}`);
+			return;
+		}
+
+		const dropped = result.toolResultsDropped + result.blocksDropped + (result.imagesDropped ?? 0);
+		if (dropped === 0) {
+			this.ctx.showStatus("Nothing to shake.");
+			return;
+		}
+		this.ctx.rebuildChatFromMessages();
+		this.ctx.statusLine.invalidate();
+		this.ctx.updateEditorTopBorder();
+		this.ctx.showStatus(formatShakeSummary(result));
 	}
 
 	async handleSkillCommand(skillPath: string, args: string): Promise<void> {

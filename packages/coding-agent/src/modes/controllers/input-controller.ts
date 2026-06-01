@@ -8,7 +8,6 @@ import { renderSegmentTrack } from "../../modes/components/segment-track";
 import { TinyTitleDownloadProgressComponent } from "../../modes/components/tiny-title-download-progress";
 import { expandEmoticons } from "../../modes/emoji-autocomplete";
 import { createPromptActionAutocompleteProvider } from "../../modes/prompt-action-autocomplete";
-import { theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../../session/messages";
@@ -165,9 +164,9 @@ export class InputController {
 		this.ctx.editor.setActionKeys("app.thinking.cycle", this.ctx.keybindings.getKeys("app.thinking.cycle"));
 		this.ctx.editor.onCycleThinkingLevel = () => this.cycleThinkingLevel();
 		this.ctx.editor.setActionKeys("app.model.cycleForward", this.ctx.keybindings.getKeys("app.model.cycleForward"));
-		this.ctx.editor.onCycleModelForward = () => this.cycleRoleModel();
+		this.ctx.editor.onCycleModelForward = () => this.cycleRoleModel("forward");
 		this.ctx.editor.setActionKeys("app.model.cycleBackward", this.ctx.keybindings.getKeys("app.model.cycleBackward"));
-		this.ctx.editor.onCycleModelBackward = () => this.cycleRoleModel({ temporary: true });
+		this.ctx.editor.onCycleModelBackward = () => this.cycleRoleModel("backward");
 		this.ctx.editor.setActionKeys(
 			"app.model.selectTemporary",
 			this.ctx.keybindings.getKeys("app.model.selectTemporary"),
@@ -184,7 +183,6 @@ export class InputController {
 		this.ctx.editor.onToggleThinking = () => this.ctx.toggleThinkingBlockVisibility();
 		this.ctx.editor.setActionKeys("app.editor.external", this.ctx.keybindings.getKeys("app.editor.external"));
 		this.ctx.editor.onExternalEditor = () => void this.openExternalEditor();
-		this.ctx.editor.onShowHotkeys = () => this.ctx.handleHotkeysCommand();
 		this.ctx.editor.setActionKeys(
 			"app.clipboard.pasteImage",
 			this.ctx.keybindings.getKeys("app.clipboard.pasteImage"),
@@ -767,10 +765,10 @@ export class InputController {
 		}
 	}
 
-	async cycleRoleModel(options?: { temporary?: boolean }): Promise<void> {
+	async cycleRoleModel(direction: "forward" | "backward" = "forward"): Promise<void> {
 		try {
 			const cycleOrder = settings.get("cycleOrder");
-			const result = await this.ctx.session.cycleRoleModels(cycleOrder, options);
+			const result = await this.ctx.session.cycleRoleModels(cycleOrder, direction);
 			if (!result) {
 				this.ctx.showStatus("Only one role model available");
 				return;
@@ -780,14 +778,12 @@ export class InputController {
 			this.ctx.updateEditorBorderColor();
 			// The status line already reports the resolved model + thinking level, so
 			// the cycle status is just a status-line-style chip track (active role
-			// filled), matching the plan-approval model slider. A dim suffix flags a
-			// temporary switch since that isn't shown elsewhere.
+			// filled), matching the plan-approval model slider.
 			const track = renderSegmentTrack(
 				cycleOrder.map(role => ({ label: role, color: getRoleInfo(role, settings).color })),
 				cycleOrder.indexOf(result.role),
 			);
-			const tempLabel = options?.temporary ? theme.fg("dim", "  (temporary)") : "";
-			this.ctx.showStatus(`${track}${tempLabel}`, { dim: false });
+			this.ctx.showStatus(track, { dim: false });
 		} catch (error) {
 			this.ctx.showError(error instanceof Error ? error.message : String(error));
 		}
@@ -804,7 +800,7 @@ export class InputController {
 				child.setExpanded(expanded);
 			}
 		}
-		this.ctx.ui.requestRender();
+		this.ctx.ui.requestRender(false, { allowUnknownViewportMutation: true });
 	}
 
 	toggleThinkingBlockVisibility(): void {

@@ -1,7 +1,6 @@
 import * as fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import * as path from "node:path";
-import { parentPort } from "node:worker_threads";
 import type {
 	ProgressInfo,
 	TextGenerationPipeline,
@@ -20,12 +19,7 @@ import {
 	type TinyTitleLocalModelSpec,
 } from "./models";
 import { formatTitleUserMessage, normalizeGeneratedTitle } from "./text";
-import type {
-	TinyTitleProgressEvent,
-	TinyTitleTransport,
-	TinyTitleWorkerInbound,
-	TinyTitleWorkerOutbound,
-} from "./title-protocol";
+import type { TinyTitleProgressEvent, TinyTitleTransport, TinyTitleWorkerInbound } from "./title-protocol";
 
 const TITLE_PREFILL = "<title>";
 const TITLE_CLOSE = "</title>";
@@ -472,8 +466,8 @@ function buildCompletionPrompt(generator: TextGenerationPipeline, promptText: st
 }
 
 /**
- * Generic single-turn completion used by Mnemosyne memory tasks (fact extraction
- * and consolidation). The caller (Mnemosyne) supplies the full task prompt; we
+ * Generic single-turn completion used by Mnemopi memory tasks (fact extraction
+ * and consolidation). The caller (Mnemopi) supplies the full task prompt; we
  * wrap it as the user turn, decode greedily, and return the raw text for the
  * caller's own parser. Output is capped to keep local inference latency bounded.
  */
@@ -495,16 +489,6 @@ async function generateCompletion(
 	})) as TextGenerationStringOutput;
 	const generated = (output[0]?.generated_text ?? "").trim();
 	return generated === "" ? null : generated;
-}
-
-function releasePipelines(): void {
-	// Intentionally NOT calling `pipeline.dispose()`. transformers.js disposes the
-	// underlying onnxruntime InferenceSession, freeing native memory that Bun's
-	// worker/NAPI teardown then frees a second time — a double-free that aborts the
-	// process on quit ("malloc: pointer being freed was not allocated" /
-	// "NAPI FATAL ERROR"). The worker is torn down immediately after `close`, so the
-	// OS reclaims the model memory regardless; skipping dispose avoids the crash.
-	pipelines.clear();
 }
 
 function enqueueRequest(
@@ -555,33 +539,6 @@ export function startTinyTitleWorker(transport: TinyTitleTransport): void {
 			transport.send({ type: "pong", id: message.id });
 			return;
 		}
-		if (message.type === "close") {
-			releasePipelines();
-			transport.send({ type: "closed" });
-			transport.close();
-			return;
-		}
 		enqueueRequest(transport, message);
 	});
 }
-
-if (!parentPort) throw new Error("tiny-title-worker: missing parentPort");
-
-const port = parentPort;
-const transport: TinyTitleTransport = {
-	send: (message: TinyTitleWorkerOutbound) => port.postMessage(message),
-	onMessage: handler => {
-		const wrap = (data: unknown): void => handler(data as TinyTitleWorkerInbound);
-		port.on("message", wrap);
-		return () => port.off("message", wrap);
-	},
-	close: () => {
-		try {
-			port.close();
-		} catch {
-			// Already closed.
-		}
-	},
-};
-
-startTinyTitleWorker(transport);

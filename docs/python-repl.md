@@ -10,6 +10,7 @@ It covers tool behavior, runner lifecycle, environment handling, execution seman
 - Subprocess kernel client: `src/eval/py/kernel.ts`
 - Python wrapper / NDJSON server: `src/eval/py/runner.py`
 - Prelude helpers loaded into every kernel: `src/eval/py/prelude.py`
+- Host-side subagent helper bridge: `src/eval/agent-bridge.ts`
 - MIME bundle renderer (text + structured outputs): `src/eval/py/display.ts`
 - Interactive-mode renderer for user-triggered Python runs: `src/modes/components/eval-execution.ts`
 - Runtime/env filtering and Python resolution: `src/eval/py/runtime.ts`
@@ -26,7 +27,7 @@ Tool params:
     language: "py" | "js";
     code: string;
     title?: string;
-    timeout?: number; // seconds, clamped to 1..600, default 30
+    timeout?: number; // seconds, clamped to 1..600, default 30. Inactivity budget — see "Cell timeout".
     reset?: boolean; // reset this cell's selected runtime before execution
   }>;
 }
@@ -159,11 +160,15 @@ The runner additionally receives `PYTHONUNBUFFERED=1` and `PYTHONIOENCODING=utf-
 
 If Python preflight fails and `eval.js` is enabled, `eval` remains available for `js` cells; `py` cells fail with a Python-backend availability error.
 
+Python prelude helpers include `agent(prompt, *, agent_type="task", model=None, context=None, label=None, schema=None)`. It synchronously calls the host bridge, runs one subagent through the task executor, and returns the final text. When `schema` is supplied, the helper parses the subagent's JSON output and returns the object.
+
 ## Execution flow and cancellation/timeout
 
 ### Cell timeout
 
-Each eval cell timeout is in seconds, defaults to 30, and is clamped to `1..600`. The tool combines caller abort signal, session abort signal, and the current cell timeout with `AbortSignal.any(...)`.
+Each eval cell `timeout` is in seconds, defaults to 30, and is clamped to `1..600`. It is an **inactivity (idle) budget, not a hard wall-clock cap**: the watchdog (`IdleTimeout`, `src/eval/idle-timeout.ts`) only fires once the cell goes the full window with **no progress signal**. Every status event re-arms it — `agent()` progress snapshots, `log()`/`phase()`, and tool-bridge activity all count — so a long-running fanout that keeps reporting progress runs to completion instead of being killed mid-stream.
+
+Raw `stdout`/`stderr` does **not** re-arm the watchdog, so a pure-compute runaway loop with no progress reporting is still bounded by `timeout`. The tool combines the caller abort signal, the session abort signal, and the idle watchdog's signal with `AbortSignal.any(...)`; no wall-clock deadline is passed to the backend, so neither runtime arms a competing fixed timer.
 
 ### Kernel execution cancellation
 
@@ -171,7 +176,7 @@ On abort/timeout:
 
 - The host sends `kill("SIGINT")` to the runner subprocess.
 - The runner's exec-time signal handler raises `KeyboardInterrupt` inside the user code.
-- Result includes `cancelled=true`; timeout path annotates output as `Command timed out after <n> seconds`.
+- Result includes `cancelled=true`; the timeout path annotates output as `Command timed out after <n> seconds of inactivity`.
 - Between requests the runner installs `SIG_IGN` for SIGINT so a stray cancel does not tear down the kernel.
 
 If a second cancel is required (runner stuck in C code), the host escalates to `SIGTERM` and the session restarts on the next call.

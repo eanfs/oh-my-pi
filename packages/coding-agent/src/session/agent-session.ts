@@ -33,18 +33,24 @@ import {
 	ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
 import {
+	AGGRESSIVE_SHAKE_CONFIG,
 	AUTO_HANDOFF_THRESHOLD_FOCUS,
+	applyShakeRegions,
 	CompactionCancelledError,
 	type CompactionPreparation,
 	type CompactionResult,
 	calculateContextTokens,
 	calculatePromptTokens,
 	collectEntriesForBranchSummary,
+	collectShakeRegions,
 	compact,
+	DEFAULT_SHAKE_CONFIG,
 	estimateTokens,
 	generateBranchSummary,
 	generateHandoff,
 	prepareCompaction,
+	type ShakeConfig,
+	type ShakeRegion,
 	type SummaryOptions,
 	shouldCompact,
 } from "@oh-my-pi/pi-agent-core/compaction";
@@ -77,7 +83,7 @@ import {
 	resolveServiceTier,
 	streamSimple,
 } from "@oh-my-pi/pi-ai";
-import { MacOSPowerAssertion } from "@oh-my-pi/pi-natives";
+import { countTokens, MacOSPowerAssertion } from "@oh-my-pi/pi-natives";
 import {
 	extractRetryHint,
 	getAgentDbPath,
@@ -148,10 +154,12 @@ import type { Goal, GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { resolveMemoryBackend } from "../memory-backend";
-import { getMnemosyneSessionState, type MnemosyneSessionState, setMnemosyneSessionState } from "../mnemosyne/state";
+import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
 import { containsOrchestrate, ORCHESTRATE_NOTICE } from "../modes/orchestrate";
 import { getCurrentThemeName, theme } from "../modes/theme/theme";
+import { parseTurnBudget } from "../modes/turn-budget";
 import { containsUltrathink, ULTRATHINK_NOTICE } from "../modes/ultrathink";
+import { containsWorkflow, WORKFLOW_NOTICE } from "../modes/workflow";
 import type { PlanModeState } from "../plan-mode/state";
 import autoContinuePrompt from "../prompts/system/auto-continue.md" with { type: "text" };
 import eagerTodoPrompt from "../prompts/system/eager-todo.md" with { type: "text" };
@@ -219,6 +227,7 @@ import type {
 	SessionManager,
 } from "./session-manager";
 import { getLatestCompactionEntry } from "./session-manager";
+import type { ShakeMode, ShakeResult } from "./shake-types";
 import { ToolChoiceQueue } from "./tool-choice-queue";
 import { YieldQueue } from "./yield-queue";
 
@@ -228,11 +237,11 @@ export type AgentSessionEvent =
 	| {
 			type: "auto_compaction_start";
 			reason: "threshold" | "overflow" | "idle" | "incomplete";
-			action: "context-full" | "handoff";
+			action: "context-full" | "handoff" | "shake";
 	  }
 	| {
 			type: "auto_compaction_end";
-			action: "context-full" | "handoff";
+			action: "context-full" | "handoff" | "shake";
 			result: CompactionResult | undefined;
 			aborted: boolean;
 			willRetry: boolean;
@@ -268,6 +277,8 @@ export interface AsyncJobSnapshot {
 	recent: AsyncJobSnapshotItem[];
 	delivery: AsyncJobDeliveryState;
 }
+
+export type { ShakeMode, ShakeResult };
 
 // ============================================================================
 // Types
@@ -1287,8 +1298,8 @@ export class AgentSession {
 		return previous;
 	}
 
-	getMnemosyneSessionState(): MnemosyneSessionState | undefined {
-		return getMnemosyneSessionState(this);
+	getMnemopiSessionState(): MnemopiSessionState | undefined {
+		return getMnemopiSessionState(this);
 	}
 
 	/** TTSR manager for time-traveling stream rules */
@@ -2838,11 +2849,11 @@ export class AgentSession {
 		this.getHindsightSessionState()?.setSessionId(sid);
 	}
 
-	#rekeyMnemosyneMemoryForCurrentSessionId(): void {
-		if (resolveMemoryBackend(this.settings).id !== "mnemosyne") return;
+	#rekeyMnemopiMemoryForCurrentSessionId(): void {
+		if (resolveMemoryBackend(this.settings).id !== "mnemopi") return;
 		const sid = this.agent.sessionId;
 		if (!sid) return;
-		this.getMnemosyneSessionState()?.setSessionId(sid);
+		this.getMnemopiSessionState()?.setSessionId(sid);
 	}
 
 	/** New session file: reset auto-recall / retain-threshold counters for the new transcript. */
@@ -2853,9 +2864,9 @@ export class AgentSession {
 		state.resetConversationTracking();
 	}
 
-	#resetMnemosyneConversationTrackingIfMnemosyne(): void {
-		if (resolveMemoryBackend(this.settings).id !== "mnemosyne") return;
-		const state = this.getMnemosyneSessionState();
+	#resetMnemopiConversationTrackingIfMnemopi(): void {
+		if (resolveMemoryBackend(this.settings).id !== "mnemopi") return;
+		const state = this.getMnemopiSessionState();
 		if (!state || state.aliasOf) return;
 		state.resetConversationTracking();
 	}
@@ -2923,8 +2934,8 @@ export class AgentSession {
 		const hindsightState = this.setHindsightSessionState(undefined);
 		await hindsightState?.flushRetainQueue();
 		hindsightState?.dispose();
-		const mnemosyneState = setMnemosyneSessionState(this, undefined);
-		mnemosyneState?.dispose();
+		const mnemopiState = setMnemopiSessionState(this, undefined);
+		mnemopiState?.dispose();
 		this.#disconnectFromAgent();
 		if (this.#unsubscribeAppendOnly) {
 			this.#unsubscribeAppendOnly();
@@ -4101,6 +4112,8 @@ export class AgentSession {
 		const keywordNotices: CustomMessage[] = [];
 		if (!options?.synthetic) {
 			const timestamp = Date.now();
+			const turnBudget = parseTurnBudget(expandedText);
+			this.sessionManager.beginTurnBudget(turnBudget?.total ?? null, turnBudget?.hard ?? false);
 			if (containsUltrathink(expandedText)) {
 				keywordNotices.push({
 					role: "custom",
@@ -4116,6 +4129,16 @@ export class AgentSession {
 					role: "custom",
 					customType: "orchestrate-notice",
 					content: ORCHESTRATE_NOTICE,
+					display: false,
+					attribution: "user",
+					timestamp,
+				});
+			}
+			if (containsWorkflow(expandedText)) {
+				keywordNotices.push({
+					role: "custom",
+					customType: "workflow-notice",
+					content: WORKFLOW_NOTICE,
 					display: false,
 					attribution: "user",
 					timestamp,
@@ -4973,9 +4996,9 @@ export class AgentSession {
 		this.setTodoPhases([]);
 		this.#syncAgentSessionId();
 		this.#rekeyHindsightMemoryForCurrentSessionId();
-		this.#rekeyMnemosyneMemoryForCurrentSessionId();
+		this.#rekeyMnemopiMemoryForCurrentSessionId();
 		this.#resetHindsightConversationTrackingIfHindsight();
-		this.#resetMnemosyneConversationTrackingIfMnemosyne();
+		this.#resetMnemopiConversationTrackingIfMnemopi();
 		this.#steeringMessages = [];
 		this.#followUpMessages = [];
 		this.#pendingNextTurnMessages = [];
@@ -5070,8 +5093,8 @@ export class AgentSession {
 		// Update agent session ID
 		this.#syncAgentSessionId();
 		this.#rekeyHindsightMemoryForCurrentSessionId();
-		this.#rekeyMnemosyneMemoryForCurrentSessionId();
-		this.#resetMnemosyneConversationTrackingIfMnemosyne();
+		this.#rekeyMnemopiMemoryForCurrentSessionId();
+		this.#resetMnemopiConversationTrackingIfMnemopi();
 
 		// Emit session_switch event with reason "fork" to hooks
 		if (this.#extensionRunner) {
@@ -5091,13 +5114,13 @@ export class AgentSession {
 
 	/**
 	 * Set model directly.
-	 * Validates API key, saves to session and settings.
+	 * Validates API key and saves to the active session. Persists settings only when requested.
 	 * @throws Error if no API key available for the model
 	 */
 	async setModel(
 		model: Model,
 		role: string = "default",
-		options?: { selector?: string; thinkingLevel?: ThinkingLevel },
+		options?: { selector?: string; thinkingLevel?: ThinkingLevel; persist?: boolean },
 	): Promise<void> {
 		const previousEditMode = this.#resolveActiveEditMode();
 		const apiKey = await this.#modelRegistry.getApiKey(model, this.sessionId);
@@ -5108,10 +5131,12 @@ export class AgentSession {
 		this.#clearActiveRetryFallback();
 		this.#setModelWithProviderSessionReset(model);
 		this.sessionManager.appendModelChange(`${model.provider}/${model.id}`, role);
-		this.settings.setModelRole(
-			role,
-			this.#formatRoleModelValue(role, model, options?.selector, options?.thinkingLevel),
-		);
+		if (options?.persist) {
+			this.settings.setModelRole(
+				role,
+				this.#formatRoleModelValue(role, model, options.selector, options.thinkingLevel),
+			);
+		}
 		this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 
 		// Re-apply thinking for the newly selected model. Prefer the model's
@@ -5214,9 +5239,8 @@ export class AgentSession {
 	}
 
 	/**
-	 * Apply a resolved role model as the active model, persisting the choice to
-	 * settings under its role. Mirrors the non-temporary branch of
-	 * {@link cycleRoleModels} and is shared with the plan-approval model slider.
+	 * Apply a resolved role model as the active model without changing global
+	 * settings. Shared with role cycling and the plan-approval model slider.
 	 */
 	async applyRoleModel(entry: ResolvedRoleModel): Promise<void> {
 		await this.setModel(entry.model, entry.role);
@@ -5227,24 +5251,21 @@ export class AgentSession {
 
 	/**
 	 * Cycle through configured role models in a fixed order.
-	 * Skips missing roles.
+	 * Skips missing roles and changes only the active session model.
 	 * @param roleOrder - Order of roles to cycle through (e.g., ["slow", "default", "smol"])
-	 * @param options - Optional settings: `temporary` to not persist to settings
+	 * @param direction - "forward" (default) or "backward"
 	 */
 	async cycleRoleModels(
 		roleOrder: readonly string[],
-		options?: { temporary?: boolean },
+		direction: "forward" | "backward" = "forward",
 	): Promise<RoleModelCycleResult | undefined> {
 		const cycle = this.getRoleModelCycle(roleOrder);
 		if (!cycle || cycle.models.length <= 1) return undefined;
 
-		const next = cycle.models[(cycle.currentIndex + 1) % cycle.models.length];
+		const step = direction === "backward" ? -1 : 1;
+		const next = cycle.models[(cycle.currentIndex + step + cycle.models.length) % cycle.models.length];
 
-		if (options?.temporary) {
-			await this.setModelTemporary(next.model, next.explicitThinkingLevel ? next.thinkingLevel : undefined);
-		} else {
-			await this.applyRoleModel(next);
-		}
+		await this.applyRoleModel(next);
 
 		return { model: next.model, thinkingLevel: this.thinkingLevel, role: next.role };
 	}
@@ -5288,7 +5309,6 @@ export class AgentSession {
 		this.#clearActiveRetryFallback();
 		this.#setModelWithProviderSessionReset(next.model);
 		this.sessionManager.appendModelChange(`${next.model.provider}/${next.model.id}`);
-		this.settings.setModelRole("default", this.#formatRoleModelValue("default", next.model));
 		this.settings.getStorage()?.recordModelUsage(`${next.model.provider}/${next.model.id}`);
 
 		// Apply the scoped model's configured thinking level, preserving auto.
@@ -5319,7 +5339,6 @@ export class AgentSession {
 		this.#clearActiveRetryFallback();
 		this.#setModelWithProviderSessionReset(nextModel);
 		this.sessionManager.appendModelChange(`${nextModel.provider}/${nextModel.id}`);
-		this.settings.setModelRole("default", this.#formatRoleModelValue("default", nextModel));
 		this.settings.getStorage()?.recordModelUsage(`${nextModel.provider}/${nextModel.id}`);
 		// Re-apply the current thinking level (or auto) for the newly selected model
 		this.#reapplyThinkingLevel();
@@ -5628,6 +5647,89 @@ export class AgentSession {
 		this.agent.replaceMessages(sessionContext.messages);
 		this.#closeCodexProviderSessionsForHistoryRewrite();
 		return { removed };
+	}
+
+	/**
+	 * Surgically reduce context by dropping heavy content ("shake").
+	 *
+	 * - `images` delegates to {@link dropImages}.
+	 * - `elide` replaces whole tool-call results and large fenced/XML blocks
+	 *   with short placeholders that embed an `artifact://` recovery link.
+	 *
+	 * Mutates the branch in place, persists via `rewriteEntries`, replays the
+	 * rebuilt context through the agent, and tears down provider sessions that
+	 * cache message identity — same rewrite contract as {@link dropImages}.
+	 *
+	 * No-op (zero counts) when nothing is eligible.
+	 */
+	async shake(mode: ShakeMode, opts: { config?: ShakeConfig; signal?: AbortSignal } = {}): Promise<ShakeResult> {
+		if (mode === "images") {
+			const { removed } = await this.dropImages();
+			return { mode, toolResultsDropped: 0, blocksDropped: 0, imagesDropped: removed, tokensFreed: 0 };
+		}
+
+		const config = opts.config ?? AGGRESSIVE_SHAKE_CONFIG;
+		const regions = collectShakeRegions(this.sessionManager.getBranch(), config);
+		if (regions.length === 0) {
+			return { mode, toolResultsDropped: 0, blocksDropped: 0, tokensFreed: 0 };
+		}
+
+		const artifactId = await this.#saveShakeArtifact(regions);
+		const replacements = regions.map((region, index) => this.#shakeElidePlaceholder(region, index, artifactId));
+
+		let toolResultsDropped = 0;
+		let blocksDropped = 0;
+		let originalTokens = 0;
+		let replacementTokens = 0;
+		const items = regions.map((region, index) => {
+			if (region.kind === "toolResult") toolResultsDropped++;
+			else blocksDropped++;
+			originalTokens += region.tokens;
+			const replacement = replacements[index];
+			if (replacement.length > 0) replacementTokens += countTokens(replacement);
+			return { region, replacement };
+		});
+
+		applyShakeRegions(items);
+
+		await this.sessionManager.rewriteEntries();
+		const sessionContext = this.buildDisplaySessionContext();
+		this.agent.replaceMessages(sessionContext.messages);
+		this.#closeCodexProviderSessionsForHistoryRewrite();
+
+		return {
+			mode,
+			toolResultsDropped,
+			blocksDropped,
+			tokensFreed: Math.max(0, originalTokens - replacementTokens),
+			artifactId,
+		};
+	}
+
+	#shakeElidePlaceholder(region: ShakeRegion, index: number, artifactId: string | undefined): string {
+		if (artifactId) {
+			return `[shaken ~${region.tokens} tokens — recover: artifact://${artifactId} (region ${index + 1})]`;
+		}
+		return `[shaken ~${region.tokens} tokens]`;
+	}
+
+	/**
+	 * Concatenate the original region contents into one session artifact so the
+	 * agent can read them back via `artifact://<id>`. Returns `undefined` when
+	 * the session is not persisted or the write fails — callers degrade to a
+	 * bare placeholder.
+	 */
+	async #saveShakeArtifact(regions: ShakeRegion[]): Promise<string | undefined> {
+		const parts: string[] = [];
+		for (let i = 0; i < regions.length; i++) {
+			const region = regions[i];
+			parts.push(`### region ${i + 1} (${region.label}, ~${region.tokens} tok)`, "", region.originalText, "");
+		}
+		try {
+			return await this.sessionManager.saveArtifact(parts.join("\n"), "shake");
+		} catch {
+			return undefined;
+		}
 	}
 
 	/**
@@ -5940,9 +6042,9 @@ export class AgentSession {
 			this.agent.reset();
 			this.#syncAgentSessionId();
 			this.#rekeyHindsightMemoryForCurrentSessionId();
-			this.#rekeyMnemosyneMemoryForCurrentSessionId();
+			this.#rekeyMnemopiMemoryForCurrentSessionId();
 			this.#resetHindsightConversationTrackingIfHindsight();
-			this.#resetMnemosyneConversationTrackingIfMnemosyne();
+			this.#resetMnemopiConversationTrackingIfMnemopi();
 			this.#steeringMessages = [];
 			this.#followUpMessages = [];
 			this.#pendingNextTurnMessages = [];
@@ -6842,6 +6944,14 @@ export class AgentSession {
 		if (compactionSettings.strategy === "off") return false;
 		if (reason !== "idle" && !compactionSettings.enabled) return false;
 		const generation = this.#promptGeneration;
+
+		// Shake runs inline (cheap, no remote LLM). On overflow recovery, if shake
+		// reclaims nothing we fall through to the summary-compaction body below so
+		// the oversized input still gets resolved.
+		if (compactionSettings.strategy === "shake") {
+			const outcome = await this.#runAutoShake(reason, willRetry, generation);
+			if (outcome !== "fallback") return false;
+		}
 		// "overflow" and "incomplete" force inline execution because they are recovery
 		// paths the caller wants resolved before scheduling the next turn. "idle" is
 		// triggered by the idle loop and does its own scheduling.
@@ -7222,6 +7332,117 @@ export class AgentSession {
 			}
 		}
 		return false;
+	}
+
+	/**
+	 * Run a shake-strategy auto-maintenance pass. Emits the
+	 * `auto_compaction_start`/`auto_compaction_end` pair with a shake `action`,
+	 * runs {@link shake} inline against the protect-window config, and schedules
+	 * continuation exactly like the context-full tail.
+	 *
+	 * Returns `"fallback"` only for an overflow recovery where shake reclaimed
+	 * nothing (or threw) — the caller then runs the summary-compaction body so
+	 * the oversized input still gets resolved. Returns `"handled"` otherwise.
+	 */
+	async #runAutoShake(
+		reason: "overflow" | "threshold" | "idle" | "incomplete",
+		willRetry: boolean,
+		generation: number,
+	): Promise<"handled" | "fallback"> {
+		const action = "shake";
+		await this.#emitSessionEvent({ type: "auto_compaction_start", reason, action });
+		this.#autoCompactionAbortController?.abort();
+		const controller = new AbortController();
+		this.#autoCompactionAbortController = controller;
+		const signal = controller.signal;
+		const compactionSettings = this.settings.getGroup("compaction");
+		try {
+			const result = await this.shake("elide", { config: DEFAULT_SHAKE_CONFIG, signal });
+			if (signal.aborted) {
+				await this.#emitSessionEvent({
+					type: "auto_compaction_end",
+					action,
+					result: undefined,
+					aborted: true,
+					willRetry: false,
+				});
+				return "handled";
+			}
+			const reclaimed = result.toolResultsDropped + result.blocksDropped > 0;
+			// Overflow needs the input to actually shrink before the retry; if shake
+			// reclaimed nothing, summarization is the only remaining recovery.
+			if (reason === "overflow" && !reclaimed) {
+				await this.#emitSessionEvent({
+					type: "auto_compaction_end",
+					action,
+					result: undefined,
+					aborted: false,
+					willRetry: false,
+					skipped: true,
+				});
+				return "fallback";
+			}
+			await this.#emitSessionEvent({
+				type: "auto_compaction_end",
+				action,
+				result: undefined,
+				aborted: false,
+				willRetry,
+				skipped: !reclaimed,
+			});
+
+			if (!willRetry && reason !== "idle" && compactionSettings.autoContinue !== false) {
+				this.#scheduleAutoContinuePrompt(generation);
+			}
+			if (willRetry) {
+				// The shake rebuild replays every entry, so a trailing error/length
+				// assistant from the failed turn re-enters agent state — drop it before
+				// retrying, same as the context-full tail.
+				const messages = this.agent.state.messages;
+				const lastMsg = messages[messages.length - 1];
+				if (lastMsg?.role === "assistant") {
+					const lastAssistant = lastMsg as AssistantMessage;
+					const shouldDrop =
+						lastAssistant.stopReason === "error" ||
+						(reason === "incomplete" && lastAssistant.stopReason === "length");
+					if (shouldDrop) this.agent.replaceMessages(messages.slice(0, -1));
+				}
+				this.#scheduleAgentContinue({ delayMs: 100, generation });
+			} else if (this.agent.hasQueuedMessages()) {
+				this.#scheduleAgentContinue({
+					delayMs: 100,
+					generation,
+					shouldContinue: () => this.agent.hasQueuedMessages(),
+				});
+			}
+			return "handled";
+		} catch (error) {
+			if (signal.aborted) {
+				await this.#emitSessionEvent({
+					type: "auto_compaction_end",
+					action,
+					result: undefined,
+					aborted: true,
+					willRetry: false,
+				});
+				return "handled";
+			}
+			const message = error instanceof Error ? error.message : "shake failed";
+			await this.#emitSessionEvent({
+				type: "auto_compaction_end",
+				action,
+				result: undefined,
+				aborted: false,
+				willRetry: false,
+				errorMessage: `Auto-shake failed: ${message}`,
+			});
+			// Overflow still needs recovery even if shake threw.
+			return reason === "overflow" ? "fallback" : "handled";
+		} finally {
+			if (this.#autoCompactionAbortController === controller) {
+				this.#autoCompactionAbortController = undefined;
+			}
+		}
 	}
 
 	/**
@@ -8421,7 +8642,7 @@ export class AgentSession {
 			await this.sessionManager.setSessionFile(sessionPath);
 			this.#syncAgentSessionId();
 			this.#rekeyHindsightMemoryForCurrentSessionId();
-			this.#rekeyMnemosyneMemoryForCurrentSessionId();
+			this.#rekeyMnemopiMemoryForCurrentSessionId();
 
 			const sessionContext = this.buildDisplaySessionContext();
 			const didReloadConversationChange =
@@ -8508,7 +8729,7 @@ export class AgentSession {
 
 			if (switchingToDifferentSession) {
 				this.#resetHindsightConversationTrackingIfHindsight();
-				this.#resetMnemosyneConversationTrackingIfMnemosyne();
+				this.#resetMnemopiConversationTrackingIfMnemopi();
 			}
 			this.#reconnectToAgent();
 			return true;
@@ -8516,7 +8737,7 @@ export class AgentSession {
 			this.sessionManager.restoreState(previousSessionState);
 			this.#syncAgentSessionId(previousSessionState.sessionId);
 			this.#rekeyHindsightMemoryForCurrentSessionId();
-			this.#rekeyMnemosyneMemoryForCurrentSessionId();
+			this.#rekeyMnemopiMemoryForCurrentSessionId();
 			let restoreMcpError: unknown;
 			try {
 				await this.#restoreMCPSelectionsForSessionContext(previousSessionContext, {
@@ -8614,9 +8835,9 @@ export class AgentSession {
 		this.#syncTodoPhasesFromBranch();
 		this.#syncAgentSessionId();
 		this.#rekeyHindsightMemoryForCurrentSessionId();
-		this.#rekeyMnemosyneMemoryForCurrentSessionId();
+		this.#rekeyMnemopiMemoryForCurrentSessionId();
 		this.#resetHindsightConversationTrackingIfHindsight();
-		this.#resetMnemosyneConversationTrackingIfMnemosyne();
+		this.#resetMnemopiConversationTrackingIfMnemopi();
 
 		// Reload messages from entries (works for both file and in-memory mode)
 		const sessionContext = this.buildDisplaySessionContext();
@@ -8997,7 +9218,7 @@ export class AgentSession {
 			const msg = messages[i];
 			if (msg.role === "assistant") {
 				const assistantMsg = msg as AssistantMessage;
-				if (assistantMsg.usage) {
+				if (assistantMsg.stopReason !== "aborted" && assistantMsg.stopReason !== "error" && assistantMsg.usage) {
 					lastUsage = assistantMsg.usage;
 					lastUsageIndex = i;
 					break;

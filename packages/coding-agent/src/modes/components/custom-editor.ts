@@ -1,7 +1,6 @@
 import { Editor, type KeyId, matchesKey, parseKittySequence } from "@oh-my-pi/pi-tui";
 import type { AppKeybinding } from "../../config/keybindings";
-import { highlightOrchestrate } from "../orchestrate";
-import { highlightUltrathink } from "../ultrathink";
+import { highlightMagicKeywords } from "../magic-keywords";
 
 type ConfigurableEditorAction = Extract<
 	AppKeybinding,
@@ -46,8 +45,9 @@ const DEFAULT_ACTION_KEYS: Record<ConfigurableEditorAction, KeyId[]> = {
  * Custom editor that handles configurable app-level shortcuts for coding-agent.
  */
 export class CustomEditor extends Editor {
-	/** Gradient-highlight the "ultrathink" / "orchestrate" keywords as the user types them. */
-	decorateText = (text: string): string => highlightOrchestrate(highlightUltrathink(text));
+	/** Gradient-highlight the "ultrathink" / "orchestrate" / "workflow" keywords as the user types
+	 *  them, skipping any occurrence inside code spans, fenced blocks, or XML sections. */
+	decorateText = (text: string): string => highlightMagicKeywords(text);
 	onEscape?: () => void;
 	shouldBypassAutocompleteOnEscape?: () => boolean;
 	onClear?: () => void;
@@ -61,7 +61,6 @@ export class CustomEditor extends Editor {
 	onExternalEditor?: () => void;
 	onHistorySearch?: () => void;
 	onSuspend?: () => void;
-	onShowHotkeys?: () => void;
 	onSelectModelTemporary?: () => void;
 	/** Called when the configured copy-prompt shortcut is pressed. */
 	onCopyPrompt?: () => void;
@@ -218,12 +217,6 @@ export class CustomEditor extends Editor {
 		// Intercept configured copy-prompt shortcut
 		if (this.#matchesAction(data, "app.clipboard.copyPrompt") && this.onCopyPrompt) {
 			this.onCopyPrompt();
-			return;
-		}
-
-		// Intercept ? when editor is empty to show hotkeys
-		if (data === "?" && this.getText().length === 0 && this.onShowHotkeys) {
-			this.onShowHotkeys();
 			return;
 		}
 
