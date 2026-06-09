@@ -143,4 +143,102 @@ describe("volcengine-coding-plan model discovery", () => {
 		expect(resolved?.supportsDeveloperRole).toBe(false);
 		expect(resolved?.reasoningContentField).toBe("reasoning_content");
 	});
+
+	it("marks dynamic discovery as authoritative so /models replaces the bundled fallback list", () => {
+		// Per-account entitlements vary on the gateway, so a successful live
+		// catalog fetch should win over the bundled ten-model snapshot.
+		const options = volcengineCodingPlanModelManagerOptions({ apiKey: "test-key" });
+		expect(options.dynamicModelsAuthoritative).toBe(true);
+	});
+});
+
+describe("volcengine-coding-plan stream watchdog widening", () => {
+	it("widens the watchdog for the global ark.volces.com host (no region prefix)", async () => {
+		const { getOpenAICompletionsStreamIdleTimeoutFallbackMs } = await import(
+			"@oh-my-pi/pi-ai/providers/openai-completions"
+		);
+
+		const makeModel = (baseUrl: string): Model<"openai-completions"> => ({
+			...baseModel,
+			provider: "custom",
+			baseUrl,
+		});
+
+		// Default Beijing host (already covered by the gateway widening).
+		const beijing = getOpenAICompletionsStreamIdleTimeoutFallbackMs(
+			makeModel("https://ark.cn-beijing.volces.com/api/coding/v3"),
+		);
+		// Global Volcengine host — same gateway, different region. The widening
+		// must cover it too so custom-endpoint users don't trip the 120s idle
+		// watchdog while the gateway buffers during the thinking phase.
+		const globalHost = getOpenAICompletionsStreamIdleTimeoutFallbackMs(
+			makeModel("https://ark.volces.com/api/coding/v3"),
+		);
+
+		expect(beijing).toBe(600_000);
+		expect(globalHost).toBe(600_000);
+	});
+});
+
+describe("volcengine-coding-plan DeepSeek tool_choice thinking suppression", () => {
+	// Volcengine Ark reaches DeepSeek through a zai-format gateway: the
+	// compat layer uses `params.thinking = { type: "enabled" | "disabled" }`
+	// rather than `reasoning_effort`. `disableReasoningOnToolChoice` strips
+	// the OpenAI-style effort keys but historically left `params.thinking`
+	// on, which re-tripped the "tool_choice while thinking is enabled"
+	// guard the flag exists to avoid. This test pins the wire contract:
+	// whenever the flag fires on a zai-format host, the request body must
+	// carry `thinking.type = "disabled"`.
+	it("forces thinking.type=disabled on deepseek requests that carry tool_choice", async () => {
+		const { streamOpenAICompletions } = await import("@oh-my-pi/pi-ai/providers/openai-completions");
+
+		const deepseekModel: Model<"openai-completions"> = {
+			...baseModel,
+			id: "deepseek-v4-pro",
+			provider: "volcengine-coding-plan",
+			baseUrl: "https://ark.cn-beijing.volces.com/api/coding/v3",
+			reasoning: true,
+		};
+
+		const { promise, resolve } = Promise.withResolvers<unknown>();
+		const originalFetch = global.fetch;
+		global.fetch = Object.assign(
+			async (_input: string | URL | Request): Promise<Response> =>
+				new Response("data: [DONE]\n\n", {
+					headers: { "content-type": "text/event-stream" },
+				}),
+			{ preconnect: originalFetch.preconnect },
+		);
+
+		try {
+			const controller = new AbortController();
+			streamOpenAICompletions(
+				deepseekModel,
+				{
+					messages: [{ role: "user", content: "Summarize the README", timestamp: Date.now() }],
+				},
+				{
+					apiKey: "test-key",
+					reasoning: "high",
+					toolChoice: { type: "tool", name: "read" },
+					signal: controller.signal,
+					onPayload: payload => resolve(payload),
+				},
+			);
+
+			const payload = (await promise) as {
+				thinking?: { type?: string };
+				reasoning_effort?: unknown;
+				tool_choice?: unknown;
+			};
+
+			// tool_choice is present, so `disableReasoningOnToolChoice` fires.
+			expect(payload.tool_choice).toBeDefined();
+			// The zai thinking field must be forced off, not left as "enabled".
+			expect(payload.thinking).toEqual({ type: "disabled" });
+			expect(payload.reasoning_effort).toBeUndefined();
+		} finally {
+			global.fetch = originalFetch;
+		}
+	});
 });

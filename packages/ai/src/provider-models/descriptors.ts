@@ -39,13 +39,13 @@ import {
 	veniceModelManagerOptions,
 	vercelAiGatewayModelManagerOptions,
 	vllmModelManagerOptions,
+	volcengineCodingPlanModelManagerOptions,
 	waferPassModelManagerOptions,
 	waferServerlessModelManagerOptions,
 	xaiModelManagerOptions,
 	xaiOAuthModelManagerOptions,
 	xiaomiModelManagerOptions,
 	zenmuxModelManagerOptions,
-	volcengineCodingPlanModelManagerOptions,
 	zhipuCodingPlanModelManagerOptions,
 } from "./openai-compat";
 import { cursorModelManagerOptions, zaiModelManagerOptions } from "./special";
@@ -331,6 +331,7 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		"doubao-seed-2.0-pro",
 		config => volcengineCodingPlanModelManagerOptions(config),
 		catalog("Volcengine Coding Plan (火山引擎)", ["VOLCENGINE_API_KEY"]),
+		{ dynamicModelsAuthoritative: true },
 	),
 	descriptor("github-copilot", "gpt-4o", config => githubCopilotModelManagerOptions(config)),
 	descriptor("google", "gemini-2.5-pro", config => googleModelManagerOptions(config)),

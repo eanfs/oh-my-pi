@@ -394,7 +394,14 @@ export function getOpenAICompletionsStreamIdleTimeoutFallbackMs(
 	// Volcengine Ark coding-plan is a multi-vendor gateway of slow reasoning
 	// models (Doubao, DeepSeek, Kimi, MiniMax, GLM) that buffer silently during
 	// the thinking phase, so widen the whole gateway rather than just GLM ids.
-	if (model.provider === "volcengine-coding-plan" || baseUrl.includes("ark.cn-beijing.volces.com")) {
+	// Both `ark.cn-beijing.volces.com` (default) and `ark.volces.com` (global)
+	// run the same gateway; `detectOpenAICompat` already treats both as
+	// Volcengine.
+	if (
+		model.provider === "volcengine-coding-plan" ||
+		baseUrl.includes("ark.cn-beijing.volces.com") ||
+		baseUrl.includes("ark.volces.com")
+	) {
 		return SLOW_CODING_PLAN_STREAM_IDLE_TIMEOUT_MS;
 	}
 
@@ -1287,13 +1294,20 @@ function buildParams(
 		}
 		params.reasoning_effort = mapReasoningEffort(minEffort, compat.reasoningEffortMap) as Effort;
 	}
-
 	if (compat.disableReasoningOnToolChoice && params.tool_choice !== undefined) {
 		// DeepSeek reasoning models accept tools/tool_choice, but reject that
 		// control field while thinking is enabled. Keep the tool-selection
 		// contract and suppress reasoning for this single request.
 		delete params.reasoning_effort;
 		delete params.reasoning;
+		// Volcengine (and other zai-format gateways) carry thinking in a
+		// separate `params.thinking` field rather than `reasoning_effort`; the
+		// generic `delete` above leaves it on, which would re-trip the
+		// "tool_choice while thinking is enabled" guard the flag exists to
+		// avoid. Force it off here as well.
+		if (compat.thinkingFormat === "zai") {
+			params.thinking = { type: "disabled" };
+		}
 	}
 
 	if (compat.disableReasoningOnForcedToolChoice && isForcedToolChoice(params.tool_choice)) {

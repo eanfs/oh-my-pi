@@ -1580,6 +1580,11 @@ export function volcengineCodingPlanModelManagerOptions(
 	const references = createBundledReferenceMap<"openai-completions">("volcengine-coding-plan");
 	return {
 		providerId: "volcengine-coding-plan",
+		// Volcengine Ark Coding Plan is a multi-vendor gateway: model IDs and
+		// entitlements vary per account. A successful `/models` fetch reflects
+		// the account's actual catalog, so treat it as authoritative instead of
+		// merging bundled fallbacks that the key may not be able to call.
+		dynamicModelsAuthoritative: true,
 		fetchDynamicModels: () =>
 			fetchOpenAICompatibleModels({
 				api: "openai-completions",

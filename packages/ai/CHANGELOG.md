@@ -4,9 +4,9 @@
 
 ### Added
 
-- Added Volcengine Coding Plan (火山引擎) provider (`volcengine-coding-plan`), a multi-vendor coding gateway (Doubao, MiniMax, GLM, DeepSeek, Kimi) via `VOLCENGINE_API_KEY`. OpenAI-compatible endpoint at `https://ark.cn-beijing.volces.com/api/coding/v3`; thinking uses binary `params.thinking.type` via `"zai"` format. `/login volcengine-coding-plan` paste-and-validate flow. The stream idle watchdog is widened to 600s for the whole gateway, since its reasoning models buffer silently during the thinking phase and would otherwise trip the default 120s timeout with `OpenAI completions stream stalled while waiting for the next event`.
-## [15.7.5] - 2026-06-01
+- Added Volcengine Coding Plan (火山引擎) provider (`volcengine-coding-plan`), a multi-vendor coding gateway (Doubao, MiniMax, GLM, DeepSeek, Kimi) via `VOLCENGINE_API_KEY`. OpenAI-compatible endpoint at `https://ark.cn-beijing.volces.com/api/coding/v3`; thinking uses binary `params.thinking.type` via `"zai"` format. `/login volcengine-coding-plan` paste-and-validate flow. The stream idle watchdog is widened to 600s for the whole gateway (including the global `ark.volces.com` host), since its reasoning models buffer silently during the thinking phase and would otherwise trip the default 120s timeout with `OpenAI completions stream stalled while waiting for the next event`. Dynamic `/models` discovery is treated as authoritative for the gateway, so per-account entitlements replace the bundled fallback list rather than augmenting it.
 
+## [15.7.5] - 2026-06-01
 ### Added
 
 - Added Anthropic task budget support, forwarding `taskBudget` as `output_config.task_budget` with the required `task-budgets-2026-03-13` beta header and accepting Anthropic gateway requests that send `output_config.task_budget`.
