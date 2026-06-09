@@ -3,7 +3,9 @@ export * from "./api-registry";
 export * from "./auth-broker";
 export { type AuthGatewayBootOptions, type ModelResolver, startAuthGateway } from "./auth-gateway/server";
 export * from "./auth-gateway/types";
+export * from "./auth-retry";
 export * from "./auth-storage";
+export * from "./effort";
 export * from "./model-cache";
 export * from "./model-manager";
 export * from "./model-thinking";
@@ -11,6 +13,7 @@ export * from "./models";
 export * from "./provider-details";
 export * from "./provider-models";
 export * from "./providers/anthropic";
+export * from "./providers/anthropic-client";
 export * from "./providers/azure-openai-responses";
 export type * from "./providers/cursor";
 export * from "./providers/gitlab-duo";
@@ -26,6 +29,7 @@ export * from "./providers/openai-completions";
 export * from "./providers/openai-responses";
 export * from "./providers/synthetic";
 export * from "./rate-limit-utils";
+export * from "./registry";
 export * from "./stream";
 export * from "./types";
 export * from "./usage";
@@ -40,13 +44,6 @@ export * from "./usage/zai";
 export * from "./utils/anthropic-auth";
 export * from "./utils/discovery";
 export * from "./utils/event-stream";
-export * from "./utils/oauth";
-export type {
-	OAuthCredentials,
-	OAuthProvider,
-	OAuthProviderId,
-	OAuthProviderInfo,
-} from "./utils/oauth/types";
 export * from "./utils/overflow";
 export * from "./utils/retry";
 export * from "./utils/schema";

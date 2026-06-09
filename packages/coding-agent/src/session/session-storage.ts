@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
-import { isEnoent, peekFile, toError } from "@oh-my-pi/pi-utils";
+import { isEnoent, peekFileEnds, toError } from "@oh-my-pi/pi-utils";
 
 const utf8Decoder = new TextDecoder("utf-8");
 
@@ -31,13 +31,13 @@ export interface SessionStorage {
 	ensureDirSync(dir: string): void;
 	existsSync(path: string): boolean;
 	writeTextSync(path: string, content: string): void;
-	readTextSync(path: string): string;
 	statSync(path: string): SessionStorageStat;
 	listFilesSync(dir: string, pattern: string): string[];
 
 	exists(path: string): Promise<boolean>;
 	readText(path: string): Promise<string>;
-	readTextPrefix(path: string, maxBytes: number): Promise<string>;
+	/** Read the requested UTF-8 byte windows from the head and tail of the file. */
+	readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]>;
 	writeText(path: string, content: string): Promise<void>;
 	rename(path: string, nextPath: string): Promise<void>;
 	unlink(path: string): Promise<void>;
@@ -151,10 +151,6 @@ export class FileSessionStorage implements SessionStorage {
 		fs.writeFileSync(fpath, content);
 	}
 
-	readTextSync(fpath: string): string {
-		return fs.readFileSync(fpath, "utf-8");
-	}
-
 	statSync(path: string): SessionStorageStat {
 		const stats = fs.statSync(path);
 		return { size: stats.size, mtimeMs: stats.mtimeMs, mtime: stats.mtime };
@@ -182,8 +178,11 @@ export class FileSessionStorage implements SessionStorage {
 		return Bun.file(path).text();
 	}
 
-	async readTextPrefix(path: string, maxBytes: number): Promise<string> {
-		return peekFile(path, maxBytes, header => utf8Decoder.decode(header));
+	async readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
+		return peekFileEnds(path, prefixBytes, suffixBytes, (head, tail) => [
+			utf8Decoder.decode(head),
+			utf8Decoder.decode(tail),
+		]);
 	}
 
 	async writeText(path: string, content: string): Promise<void> {
@@ -272,8 +271,8 @@ class MemorySessionStorageWriter implements SessionStorageWriter {
 		if (this.#closed) throw new Error("Writer closed");
 		if (this.#error) throw this.#error;
 		try {
-			const existing = this.#storage.existsSync(this.#path) ? this.#storage.readTextSync(this.#path) : "";
-			this.#storage.writeTextSync(this.#path, `${existing}${line}`);
+			// O(1) append — push onto the path's indexed in-memory entry.
+			this.#storage.appendSync(this.#path, line);
 		} catch (err) {
 			throw this.#recordError(err);
 		}
@@ -302,8 +301,140 @@ class MemorySessionStorageWriter implements SessionStorageWriter {
 	}
 }
 
+interface MemoryFileEntry {
+	chunks: string[];
+	cumulativeBytes: number[];
+	size: number;
+	mtimeMs: number;
+}
+
+function createMemoryFileEntry(content: string, mtimeMs: number): MemoryFileEntry {
+	const size = Buffer.byteLength(content, "utf-8");
+	return {
+		chunks: size === 0 ? [] : [content],
+		cumulativeBytes: size === 0 ? [] : [size],
+		size,
+		mtimeMs,
+	};
+}
+
+function appendMemoryChunk(entry: MemoryFileEntry, chunk: string): void {
+	const chunkSize = Buffer.byteLength(chunk, "utf-8");
+	if (chunkSize === 0) return;
+	entry.size += chunkSize;
+	entry.chunks.push(chunk);
+	entry.cumulativeBytes.push(entry.size);
+}
+
+function normalizeByteLimit(maxBytes: number, size: number): number {
+	if (!(maxBytes > 0) || size === 0) return 0;
+	return Math.min(Math.trunc(maxBytes), size);
+}
+
+function lowerBound(values: readonly number[], target: number): number {
+	let lo = 0;
+	let hi = values.length;
+	while (lo < hi) {
+		const mid = (lo + hi) >>> 1;
+		if (values[mid] < target) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	return lo;
+}
+
+function upperBound(values: readonly number[], target: number): number {
+	let lo = 0;
+	let hi = values.length;
+	while (lo < hi) {
+		const mid = (lo + hi) >>> 1;
+		if (values[mid] <= target) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	return lo;
+}
+
+function joinChunkRange(chunks: readonly string[], start: number, end: number): string {
+	const count = end - start;
+	if (count <= 0) return "";
+	if (count === 1) return chunks[start] ?? "";
+
+	let content = "";
+	for (let i = start; i < end; i++) {
+		content += chunks[i];
+	}
+	return content;
+}
+
+function decodeChunkByteRange(chunk: string, startByte: number, endByte: number, chunkSize: number): string {
+	if (startByte >= endByte) return "";
+	if (startByte === 0 && endByte === chunkSize) return chunk;
+	if (chunk.length === chunkSize) return chunk.slice(startByte, endByte);
+	const bytes = Buffer.from(chunk, "utf-8");
+	return utf8Decoder.decode(bytes.subarray(startByte, endByte));
+}
+
+function materializeMemoryEntry(entry: MemoryFileEntry): string {
+	const { chunks } = entry;
+	if (chunks.length === 0) return "";
+	if (chunks.length === 1) return chunks[0];
+
+	const content = chunks.join("");
+	entry.chunks = [content];
+	entry.cumulativeBytes = [entry.size];
+	return content;
+}
+
+function sliceChunksHead(entry: MemoryFileEntry, maxBytes: number): string {
+	const limit = normalizeByteLimit(maxBytes, entry.size);
+	if (limit === 0) return "";
+	if (limit >= entry.size) return materializeMemoryEntry(entry);
+
+	const boundaryIndex = lowerBound(entry.cumulativeBytes, limit);
+	const chunkStart = boundaryIndex === 0 ? 0 : entry.cumulativeBytes[boundaryIndex - 1];
+	const chunkEnd = entry.cumulativeBytes[boundaryIndex];
+	if (chunkEnd === limit) return joinChunkRange(entry.chunks, 0, boundaryIndex + 1);
+
+	const chunk = entry.chunks[boundaryIndex];
+	const chunkPrefix = decodeChunkByteRange(chunk, 0, limit - chunkStart, chunkEnd - chunkStart);
+	return joinChunkRange(entry.chunks, 0, boundaryIndex) + chunkPrefix;
+}
+
+function sliceChunksTail(entry: MemoryFileEntry, maxBytes: number): string {
+	const limit = normalizeByteLimit(maxBytes, entry.size);
+	if (limit === 0) return "";
+	if (limit >= entry.size) return materializeMemoryEntry(entry);
+
+	const startByte = entry.size - limit;
+	const boundaryIndex = upperBound(entry.cumulativeBytes, startByte);
+	const chunkStart = boundaryIndex === 0 ? 0 : entry.cumulativeBytes[boundaryIndex - 1];
+	const chunkEnd = entry.cumulativeBytes[boundaryIndex];
+	const chunkOffset = startByte - chunkStart;
+	if (chunkOffset === 0) return joinChunkRange(entry.chunks, boundaryIndex, entry.chunks.length);
+
+	const chunk = entry.chunks[boundaryIndex];
+	const chunkSuffix = decodeChunkByteRange(chunk, chunkOffset, chunkEnd - chunkStart, chunkEnd - chunkStart);
+	return chunkSuffix + joinChunkRange(entry.chunks, boundaryIndex + 1, entry.chunks.length);
+}
+
 export class MemorySessionStorage implements SessionStorage {
-	#files = new Map<string, { content: string; mtimeMs: number }>();
+	// Each path keeps appended string chunks plus cumulative UTF-8 byte offsets.
+	// Full reads materialize the chunks into one string chunk, so repeated reads
+	// do not re-join stale history. Later appends still stay O(1) by pushing
+	// after that materialized chunk. Prefix/suffix reads binary-search byte
+	// offsets and join only the requested window.
+	#files = new Map<string, MemoryFileEntry>();
+
+	#requireEntry(path: string): MemoryFileEntry {
+		const entry = this.#files.get(path);
+		if (!entry) throw new Error(`File not found: ${path}`);
+		return entry;
+	}
 
 	ensureDirSync(_dir: string): void {
 		// No-op for in-memory storage.
@@ -314,20 +445,29 @@ export class MemorySessionStorage implements SessionStorage {
 	}
 
 	writeTextSync(path: string, content: string): void {
-		this.#files.set(path, { content, mtimeMs: Date.now() });
+		this.#files.set(path, createMemoryFileEntry(content, Date.now()));
 	}
 
-	readTextSync(path: string): string {
-		const entry = this.#files.get(path);
-		if (!entry) throw new Error(`File not found: ${path}`);
-		return entry.content;
+	/**
+	 * Internal O(1) append used by {@link MemorySessionStorageWriter}. Lazily
+	 * creates the entry. External callers should go through `openWriter()`
+	 * rather than touching the mirror directly.
+	 */
+	appendSync(path: string, chunk: string): void {
+		const mtimeMs = Date.now();
+		let entry = this.#files.get(path);
+		if (!entry) {
+			entry = createMemoryFileEntry("", mtimeMs);
+			this.#files.set(path, entry);
+		}
+		appendMemoryChunk(entry, chunk);
+		entry.mtimeMs = mtimeMs;
 	}
 
 	statSync(path: string): SessionStorageStat {
-		const entry = this.#files.get(path);
-		if (!entry) throw new Error(`File not found: ${path}`);
+		const entry = this.#requireEntry(path);
 		return {
-			size: entry.content.length,
+			size: entry.size,
 			mtimeMs: entry.mtimeMs,
 			mtime: new Date(entry.mtimeMs),
 		};
@@ -353,13 +493,13 @@ export class MemorySessionStorage implements SessionStorage {
 	readText(path: string): Promise<string> {
 		const entry = this.#files.get(path);
 		if (!entry) return Promise.reject(new Error(`File not found: ${path}`));
-		return Promise.resolve(entry.content);
+		return Promise.resolve(materializeMemoryEntry(entry));
 	}
 
-	readTextPrefix(path: string, maxBytes: number): Promise<string> {
+	readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
 		const entry = this.#files.get(path);
 		if (!entry) return Promise.reject(new Error(`File not found: ${path}`));
-		return Promise.resolve(entry.content.slice(0, maxBytes));
+		return Promise.resolve([sliceChunksHead(entry, prefixBytes), sliceChunksTail(entry, suffixBytes)]);
 	}
 
 	writeText(path: string, content: string): Promise<void> {

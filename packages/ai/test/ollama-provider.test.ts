@@ -1,15 +1,8 @@
-import { afterEach, describe, expect, test, vi } from "bun:test";
-import { Effort } from "../src/model-thinking";
-import { ollamaModelManagerOptions } from "../src/provider-models/openai-compat";
-import { streamOllama } from "../src/providers/ollama";
-import type { Context, Model, Tool } from "../src/types";
-
-const originalFetch = global.fetch;
-
-afterEach(() => {
-	global.fetch = originalFetch;
-	vi.restoreAllMocks();
-});
+import { describe, expect, test, vi } from "bun:test";
+import { Effort } from "@oh-my-pi/pi-ai/effort";
+import { ollamaModelManagerOptions } from "@oh-my-pi/pi-ai/provider-models/openai-compat";
+import { streamOllama } from "@oh-my-pi/pi-ai/providers/ollama";
+import type { Context, FetchImpl, Model, Tool } from "@oh-my-pi/pi-ai/types";
 
 interface OllamaRequestBody {
 	tools?: Array<{ function: { name: string } }>;
@@ -18,7 +11,7 @@ interface OllamaRequestBody {
 
 describe("ollama local provider discovery", () => {
 	test("applies /api/show context and thinking capabilities to OpenAI-compatible local models", async () => {
-		global.fetch = vi.fn(async (input, init) => {
+		const fetchMock: FetchImpl = vi.fn(async (input, init) => {
 			const url = String(input);
 			if (url === "http://127.0.0.1:11434/v1/models") {
 				return new Response(
@@ -41,9 +34,9 @@ describe("ollama local provider discovery", () => {
 				);
 			}
 			throw new Error(`Unexpected URL: ${url}`);
-		}) as unknown as typeof fetch;
+		});
 
-		const options = ollamaModelManagerOptions();
+		const options = ollamaModelManagerOptions({ fetch: fetchMock });
 		const models = await options.fetchDynamicModels?.();
 		const model = models?.find(candidate => candidate.id === "deepseek-v4:latest");
 
@@ -53,18 +46,60 @@ describe("ollama local provider discovery", () => {
 		expect(model?.thinking).toEqual({ mode: "effort", minLevel: Effort.Minimal, maxLevel: Effort.High });
 		expect(model?.input).toEqual(["text", "image"]);
 	});
+
+	test("remaps Ollama's unsupported reasoning levels and skips non-reasoning models", async () => {
+		const fetchMock: FetchImpl = vi.fn(async (input, init) => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:11434/v1/models") {
+				return new Response(
+					JSON.stringify({
+						object: "list",
+						data: [
+							{ id: "gemma4:e4b", object: "model" },
+							{ id: "llama-plain:latest", object: "model" },
+						],
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			if (url === "http://127.0.0.1:11434/api/show") {
+				const body = JSON.parse(String(init?.body ?? "{}")) as { model?: string };
+				const thinking = body.model === "gemma4:e4b";
+				return new Response(
+					JSON.stringify({
+						capabilities: thinking ? ["completion", "tools", "thinking"] : ["completion", "tools"],
+						model_info: {},
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		});
+
+		const models = await ollamaModelManagerOptions({ fetch: fetchMock }).fetchDynamicModels?.();
+		const reasoningModel = models?.find(candidate => candidate.id === "gemma4:e4b");
+		const plainModel = models?.find(candidate => candidate.id === "llama-plain:latest");
+
+		// Ollama's OpenAI-compatible endpoint rejects "minimal"/"xhigh" with HTTP 400;
+		// reasoning models must remap them onto accepted levels (low/max).
+		expect(reasoningModel?.reasoning).toBe(true);
+		expect(reasoningModel?.compat?.reasoningEffortMap).toMatchObject({ minimal: "low", xhigh: "max" });
+		// Non-reasoning models never send an effort, so they carry no remap.
+		expect(plainModel?.reasoning).toBe(false);
+		expect(plainModel?.compat?.reasoningEffortMap).toBeUndefined();
+	});
 });
 
 describe("ollama tool forcing", () => {
 	test("limits named forced tool requests to the selected tool", async () => {
 		let requestBody: OllamaRequestBody | undefined;
-		global.fetch = vi.fn(async (_input, init) => {
+		const fetchMock: FetchImpl = vi.fn(async (_input, init) => {
 			requestBody = JSON.parse(String(init?.body ?? "{}")) as OllamaRequestBody;
 			return new Response(`${JSON.stringify({ done: true })}\n`, {
 				status: 200,
 				headers: { "Content-Type": "application/x-ndjson" },
 			});
-		}) as unknown as typeof fetch;
+		});
 
 		const model = {
 			id: "ggml-org/gemma-3-1b-it/GGUF",
@@ -97,6 +132,7 @@ describe("ollama tool forcing", () => {
 		for await (const event of streamOllama(model, context, {
 			apiKey: "test-key",
 			toolChoice: { type: "function", name: "write" },
+			fetch: fetchMock,
 		})) {
 			eventTypes.push(event.type);
 		}

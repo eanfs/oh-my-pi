@@ -1,19 +1,13 @@
-import { afterEach, describe, expect, it } from "bun:test";
-import { getBundledModel } from "../src/models";
+import { describe, expect, it } from "bun:test";
+import { getBundledModel } from "@oh-my-pi/pi-ai/models";
 import {
 	applyOpenRouterRoutingVariant,
 	convertMessages,
 	detectCompat,
 	streamOpenAICompletions,
-} from "../src/providers/openai-completions";
-import { resolveOpenAICompat } from "../src/providers/openai-completions-compat";
-import type { AssistantMessage, Context, Model, OpenAICompat } from "../src/types";
-
-const originalFetch = global.fetch;
-
-afterEach(() => {
-	global.fetch = originalFetch;
-});
+} from "@oh-my-pi/pi-ai/providers/openai-completions";
+import { type ResolvedOpenAICompat, resolveOpenAICompat } from "@oh-my-pi/pi-ai/providers/openai-completions-compat";
+import type { AssistantMessage, Context, FetchImpl, Model, OpenAICompat } from "@oh-my-pi/pi-ai/types";
 
 function createAbortedSignal(): AbortSignal {
 	const controller = new AbortController();
@@ -46,12 +40,12 @@ function createSseResponse(events: unknown[]): Response {
 	});
 }
 
-function createMockFetch(events: unknown[]): typeof fetch {
+function createMockFetch(events: unknown[]): FetchImpl {
 	async function mockFetch(_input: string | URL | Request, _init?: RequestInit): Promise<Response> {
 		return createSseResponse(events);
 	}
 
-	return Object.assign(mockFetch, { preconnect: originalFetch.preconnect });
+	return Object.assign(mockFetch, { preconnect: fetch.preconnect });
 }
 
 function baseContext(): Context {
@@ -64,6 +58,47 @@ function baseContext(): Context {
 			},
 		],
 	};
+}
+
+async function captureOpenAICompletionsPayload(
+	model: Model<"openai-completions">,
+	context: Context = baseContext(),
+): Promise<unknown> {
+	const { promise, resolve } = Promise.withResolvers<unknown>();
+	const fetchMock = createMockFetch(["[DONE]"]);
+	streamOpenAICompletions(model, context, {
+		apiKey: "test-key",
+		fetch: fetchMock,
+		signal: createAbortedSignal(),
+		onPayload: payload => resolve(payload),
+	});
+	return promise;
+}
+
+function getPayloadMessages(payload: unknown): object[] {
+	const payloadObject = toObject(payload);
+	const messages = payloadObject ? Reflect.get(payloadObject, "messages") : undefined;
+	if (!Array.isArray(messages)) throw new Error("payload messages missing");
+	return messages.map(message => {
+		const messageObject = toObject(message);
+		if (!messageObject) throw new Error("payload message is not an object");
+		return messageObject;
+	});
+}
+
+function getLastPayloadContent(payload: unknown): unknown {
+	const lastMessage = getPayloadMessages(payload).at(-1);
+	if (!lastMessage) throw new Error("payload has no messages");
+	return Reflect.get(lastMessage, "content");
+}
+
+function getLastTextPart(content: unknown): object | undefined {
+	if (!Array.isArray(content)) return undefined;
+	for (let index = content.length - 1; index >= 0; index--) {
+		const part = toObject(content[index]);
+		if (part && Reflect.get(part, "type") === "text") return part;
+	}
+	return undefined;
 }
 
 describe("openai-completions compatibility", () => {
@@ -97,7 +132,7 @@ describe("openai-completions compatibility", () => {
 			extraBody: {},
 			supportsStrictMode: true,
 			toolStrictMode: "none",
-		} satisfies Required<OpenAICompat>;
+		} satisfies ResolvedOpenAICompat;
 		const assistantMessage: AssistantMessage = {
 			role: "assistant",
 			content: [
@@ -367,7 +402,7 @@ describe("openai-completions compatibility", () => {
 			...getBundledModel("openai", "gpt-4o-mini"),
 			api: "openai-completions",
 		};
-		global.fetch = createMockFetch([
+		const fetchMock = createMockFetch([
 			{
 				id: "chatcmpl-test",
 				object: "chat.completion.chunk",
@@ -395,7 +430,10 @@ describe("openai-completions compatibility", () => {
 			"[DONE]",
 		]);
 
-		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+		const result = await streamOpenAICompletions(model, baseContext(), {
+			apiKey: "test-key",
+			fetch: fetchMock,
+		}).result();
 		expect(result.stopReason).toBe("stop");
 		expect(result.usage.input).toBe(10);
 		expect(result.usage.output).toBe(3);
@@ -429,7 +467,7 @@ describe("openai-completions compatibility", () => {
 			...getBundledModel("openai", "gpt-4o-mini"),
 			api: "openai-completions",
 		};
-		global.fetch = createMockFetch([
+		const fetchMock = createMockFetch([
 			{
 				id: "chatcmpl-end",
 				object: "chat.completion.chunk",
@@ -447,7 +485,10 @@ describe("openai-completions compatibility", () => {
 			"[DONE]",
 		]);
 
-		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+		const result = await streamOpenAICompletions(model, baseContext(), {
+			apiKey: "test-key",
+			fetch: fetchMock,
+		}).result();
 		expect(result.stopReason).toBe("stop");
 		expect(result.content[0]).toMatchObject({ type: "text", text: "done" });
 	});
@@ -465,9 +506,10 @@ describe("openai-completions compatibility", () => {
 		};
 
 		const { promise, resolve } = Promise.withResolvers<unknown>();
-		global.fetch = createMockFetch(["[DONE]"]);
+		const fetchMock = createMockFetch(["[DONE]"]);
 		streamOpenAICompletions(model, baseContext(), {
 			apiKey: "test-key",
+			fetch: fetchMock,
 			signal: createAbortedSignal(),
 			onPayload: payload => resolve(payload),
 		});
@@ -486,7 +528,7 @@ describe("openai-completions compatibility", () => {
 			...getBundledModel("openai", "gpt-4o-mini"),
 			api: "openai-completions",
 		};
-		global.fetch = createMockFetch([
+		const fetchMock = createMockFetch([
 			{
 				id: "chatcmpl-reasoning-text",
 				object: "chat.completion.chunk",
@@ -509,7 +551,10 @@ describe("openai-completions compatibility", () => {
 			"[DONE]",
 		]);
 
-		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+		const result = await streamOpenAICompletions(model, baseContext(), {
+			apiKey: "test-key",
+			fetch: fetchMock,
+		}).result();
 		expect(result.content).toContainEqual({
 			type: "thinking",
 			thinking: "inspect tool output",
@@ -561,10 +606,17 @@ describe("kimi model detection via detectCompat", () => {
 	// `compat.thinkingFormat` per catalog entry (e.g. kimi-code, wafer-serverless).
 	it("reserves zai for native Kimi hosts and defaults proxies to OpenAI reasoning_effort", () => {
 		// Native Moonshot surface → z.ai binary thinking.
-		expect(detectCompat(kimiMoonshotModel("kimi-k2.5")).thinkingFormat).toBe("zai");
+		const moonshotK25 = detectCompat(kimiMoonshotModel("kimi-k2.5"));
+		expect(moonshotK25.thinkingFormat).toBe("zai");
+		expect(moonshotK25.thinkingKeep).toBeUndefined();
+		const moonshotK26 = detectCompat(kimiMoonshotModel("kimi-k2.6"));
+		expect(moonshotK26.thinkingFormat).toBe("zai");
+		expect(moonshotK26.thinkingKeep).toBe("all");
 
 		// OpenAI-compatible proxies → reasoning_effort ("openai").
-		expect(detectCompat(kimiOpenCodeModel("kimi-k2.6")).thinkingFormat).toBe("openai");
+		const opencodeK26 = detectCompat(kimiOpenCodeModel("kimi-k2.6"));
+		expect(opencodeK26.thinkingFormat).toBe("openai");
+		expect(opencodeK26.thinkingKeep).toBeUndefined();
 		const kiloKimi: Model<"openai-completions"> = {
 			...getBundledModel("openai", "gpt-4o-mini"),
 			api: "openai-completions",
@@ -722,7 +774,7 @@ describe("kimi model detection via detectCompat", () => {
 		};
 
 		const { promise, resolve } = Promise.withResolvers<unknown>();
-		global.fetch = createMockFetch(["[DONE]"]);
+		const fetchMock = createMockFetch(["[DONE]"]);
 		streamOpenAICompletions(
 			model,
 			{
@@ -741,6 +793,7 @@ describe("kimi model detection via detectCompat", () => {
 			},
 			{
 				apiKey: "test-key",
+				fetch: fetchMock,
 				reasoning: "high",
 				signal: createAbortedSignal(),
 				onPayload: payload => resolve(payload),
@@ -788,7 +841,7 @@ describe("kimi model detection via detectCompat", () => {
 		};
 
 		const { promise, resolve } = Promise.withResolvers<unknown>();
-		global.fetch = createMockFetch(["[DONE]"]);
+		const fetchMock = createMockFetch(["[DONE]"]);
 		streamOpenAICompletions(
 			model,
 			{
@@ -807,6 +860,7 @@ describe("kimi model detection via detectCompat", () => {
 			},
 			{
 				apiKey: "test-key",
+				fetch: fetchMock,
 				signal: createAbortedSignal(),
 				onPayload: payload => resolve(payload),
 			},
@@ -858,7 +912,7 @@ describe("kimi model detection via detectCompat", () => {
 		};
 
 		const { promise, resolve } = Promise.withResolvers<unknown>();
-		global.fetch = createMockFetch(["[DONE]"]);
+		const fetchMock = createMockFetch(["[DONE]"]);
 		streamOpenAICompletions(
 			model,
 			{
@@ -877,6 +931,7 @@ describe("kimi model detection via detectCompat", () => {
 			},
 			{
 				apiKey: "test-key",
+				fetch: fetchMock,
 				reasoning: "high",
 				// Forced tool choice triggers `disableReasoningOnForcedToolChoice`
 				// for Kimi, suppressing reasoning_effort on the wire body.
@@ -947,7 +1002,7 @@ describe("kimi model detection via detectCompat", () => {
 		};
 
 		const { promise, resolve } = Promise.withResolvers<unknown>();
-		global.fetch = createMockFetch(["[DONE]"]);
+		const fetchMock = createMockFetch(["[DONE]"]);
 		streamOpenAICompletions(
 			model,
 			{
@@ -966,6 +1021,7 @@ describe("kimi model detection via detectCompat", () => {
 			},
 			{
 				apiKey: "test-key",
+				fetch: fetchMock,
 				reasoning: "high",
 				signal: createAbortedSignal(),
 				onPayload: payload => resolve(payload),
@@ -1030,7 +1086,7 @@ describe("kimi model detection via detectCompat", () => {
 		};
 
 		const { promise, resolve } = Promise.withResolvers<unknown>();
-		global.fetch = createMockFetch(["[DONE]"]);
+		const fetchMock = createMockFetch(["[DONE]"]);
 		streamOpenAICompletions(
 			model,
 			{
@@ -1049,6 +1105,7 @@ describe("kimi model detection via detectCompat", () => {
 			},
 			{
 				apiKey: "test-key",
+				fetch: fetchMock,
 				reasoning,
 				signal: createAbortedSignal(),
 				onPayload: payload => resolve(payload),
@@ -1199,7 +1256,7 @@ describe("NVIDIA NIM DeepSeek special-token stripping", () => {
 
 	it("strips leaked <\uff5cDSML\uff5c...\uff5c> markers from visible content", async () => {
 		const model = nvidiaDeepseekModel();
-		global.fetch = createMockFetch([
+		const fetchMock = createMockFetch([
 			{
 				id: "chatcmpl-nim-1",
 				object: "chat.completion.chunk",
@@ -1222,7 +1279,10 @@ describe("NVIDIA NIM DeepSeek special-token stripping", () => {
 			"[DONE]",
 		]);
 
-		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+		const result = await streamOpenAICompletions(model, baseContext(), {
+			apiKey: "test-key",
+			fetch: fetchMock,
+		}).result();
 		const text = result.content
 			.filter(b => b.type === "text")
 			.map(b => (b as { text: string }).text)
@@ -1234,7 +1294,7 @@ describe("NVIDIA NIM DeepSeek special-token stripping", () => {
 
 	it("holds back partial token split across chunks", async () => {
 		const model = nvidiaDeepseekModel();
-		global.fetch = createMockFetch([
+		const fetchMock = createMockFetch([
 			{
 				id: "chatcmpl-nim-2",
 				object: "chat.completion.chunk",
@@ -1259,7 +1319,10 @@ describe("NVIDIA NIM DeepSeek special-token stripping", () => {
 			"[DONE]",
 		]);
 
-		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+		const result = await streamOpenAICompletions(model, baseContext(), {
+			apiKey: "test-key",
+			fetch: fetchMock,
+		}).result();
 		const text = result.content
 			.filter(b => b.type === "text")
 			.map(b => (b as { text: string }).text)
@@ -1269,7 +1332,7 @@ describe("NVIDIA NIM DeepSeek special-token stripping", () => {
 
 	it("flushes a dangling partial open delimiter at end of stream", async () => {
 		const model = nvidiaDeepseekModel();
-		global.fetch = createMockFetch([
+		const fetchMock = createMockFetch([
 			{
 				id: "chatcmpl-nim-3",
 				object: "chat.completion.chunk",
@@ -1289,7 +1352,10 @@ describe("NVIDIA NIM DeepSeek special-token stripping", () => {
 
 		// At end-of-stream we have no way to know whether the partial is a real token,
 		// so we emit it verbatim rather than swallow legitimate text forever.
-		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+		const result = await streamOpenAICompletions(model, baseContext(), {
+			apiKey: "test-key",
+			fetch: fetchMock,
+		}).result();
 		const text = result.content
 			.filter(b => b.type === "text")
 			.map(b => (b as { text: string }).text)
@@ -1305,7 +1371,7 @@ describe("NVIDIA NIM DeepSeek special-token stripping", () => {
 			baseUrl: "https://integrate.api.nvidia.com/v1",
 			id: "meta/llama-3.3-70b-instruct",
 		};
-		global.fetch = createMockFetch([
+		const fetchMock = createMockFetch([
 			{
 				id: "chatcmpl-nim-4",
 				object: "chat.completion.chunk",
@@ -1323,7 +1389,10 @@ describe("NVIDIA NIM DeepSeek special-token stripping", () => {
 			"[DONE]",
 		]);
 
-		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+		const result = await streamOpenAICompletions(model, baseContext(), {
+			apiKey: "test-key",
+			fetch: fetchMock,
+		}).result();
 		const text = result.content
 			.filter(b => b.type === "text")
 			.map(b => (b as { text: string }).text)
@@ -1363,13 +1432,57 @@ describe("applyOpenRouterRoutingVariant", () => {
 	});
 });
 
+describe("anthropic cache control for OpenAI-compatible chat completions", () => {
+	function claudeProxyModel(compat?: OpenAICompat): Model<"openai-completions"> {
+		return {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			provider: "litellm",
+			baseUrl: "https://litellm.example/v1",
+			id: "claude-opus-4-8",
+			compat,
+		};
+	}
+
+	function cacheContext(): Context {
+		return { messages: [{ role: "user", content: "cache me", timestamp: 0 }] };
+	}
+
+	it("injects Anthropic cache_control when compat requests Anthropic cache markers", async () => {
+		const payload = await captureOpenAICompletionsPayload(
+			claudeProxyModel({ cacheControlFormat: "anthropic" }),
+			cacheContext(),
+		);
+		const content = getLastPayloadContent(payload);
+		const textPart = getLastTextPart(content);
+
+		expect(Reflect.get(textPart ?? {}, "text")).toBe("cache me");
+		expect(Reflect.get(textPart ?? {}, "cache_control")).toEqual({ type: "ephemeral" });
+	});
+
+	it("preserves OpenRouter Anthropic cache_control detection", async () => {
+		const model = getBundledModel("openrouter", "anthropic/claude-sonnet-4") as Model<"openai-completions">;
+		const payload = await captureOpenAICompletionsPayload(model, cacheContext());
+		const content = getLastPayloadContent(payload);
+		const textPart = getLastTextPart(content);
+
+		expect(Reflect.get(textPart ?? {}, "cache_control")).toEqual({ type: "ephemeral" });
+	});
+
+	it("does not infer Anthropic cache_control for custom Claude ids without compat", async () => {
+		const payload = await captureOpenAICompletionsPayload(claudeProxyModel(), cacheContext());
+
+		expect(getLastPayloadContent(payload)).toBe("cache me");
+	});
+});
 describe("openrouterVariant request integration", () => {
 	it("appends the configured variant suffix to params.model for OpenRouter requests", async () => {
 		const model = getBundledModel("openrouter", "anthropic/claude-sonnet-4") as Model<"openai-completions">;
 		const { promise, resolve } = Promise.withResolvers<unknown>();
-		global.fetch = createMockFetch(["[DONE]"]);
+		const fetchMock = createMockFetch(["[DONE]"]);
 		streamOpenAICompletions(model, baseContext(), {
 			apiKey: "test-key",
+			fetch: fetchMock,
 			signal: createAbortedSignal(),
 			openrouterVariant: "nitro",
 			onPayload: payload => resolve(payload),
@@ -1385,9 +1498,10 @@ describe("openrouterVariant request integration", () => {
 			id: `${base.id}:online`,
 		};
 		const { promise, resolve } = Promise.withResolvers<unknown>();
-		global.fetch = createMockFetch(["[DONE]"]);
+		const fetchMock = createMockFetch(["[DONE]"]);
 		streamOpenAICompletions(model, baseContext(), {
 			apiKey: "test-key",
+			fetch: fetchMock,
 			signal: createAbortedSignal(),
 			openrouterVariant: "nitro",
 			onPayload: payload => resolve(payload),
@@ -1402,9 +1516,10 @@ describe("openrouterVariant request integration", () => {
 			api: "openai-completions",
 		};
 		const { promise, resolve } = Promise.withResolvers<unknown>();
-		global.fetch = createMockFetch(["[DONE]"]);
+		const fetchMock = createMockFetch(["[DONE]"]);
 		streamOpenAICompletions(model, baseContext(), {
 			apiKey: "test-key",
+			fetch: fetchMock,
 			signal: createAbortedSignal(),
 			openrouterVariant: "nitro",
 			onPayload: payload => resolve(payload),

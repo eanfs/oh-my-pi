@@ -7,7 +7,13 @@
  * - Register commands, keyboard shortcuts, and CLI flags
  * - Interact with the user via UI primitives
  */
-import type { AgentMessage, AgentToolResult, AgentToolUpdateCallback, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import type {
+	AgentMessage,
+	AgentToolResult,
+	AgentToolUpdateCallback,
+	ThinkingLevel,
+	ToolApproval,
+} from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type {
 	Api,
@@ -22,9 +28,11 @@ import type {
 	TextContent,
 	TSchema,
 } from "@oh-my-pi/pi-ai";
-import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/utils/oauth/types";
+import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oauth/types";
 import type * as piCodingAgent from "@oh-my-pi/pi-coding-agent";
 import type { AutocompleteItem, Component, EditorTheme, KeyId, TUI } from "@oh-my-pi/pi-tui";
+import type { logger as PiLogger } from "@oh-my-pi/pi-utils";
+import type * as Zod from "zod/v4";
 import type { KeybindingsManager } from "../../config/keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { EditToolDetails } from "../../edit";
@@ -81,6 +89,7 @@ import type {
 	TurnStartEvent,
 } from "../shared-events";
 import type { SlashCommandInfo } from "../slash-commands";
+import type * as TypeBox from "../typebox";
 
 export type { AppKeybinding, KeybindingsManager } from "../../config/keybindings";
 export type { ExecOptions, ExecResult } from "../../exec/exec";
@@ -89,6 +98,17 @@ export type { AgentToolResult, AgentToolUpdateCallback };
 // ============================================================================
 // UI Context
 // ============================================================================
+
+export interface ExtensionUISelectOption {
+	label: string;
+	description?: string;
+}
+
+export type ExtensionUISelectItem = string | ExtensionUISelectOption;
+
+export function getExtensionUISelectOptionLabel(option: ExtensionUISelectItem): string {
+	return typeof option === "string" ? option : option.label;
+}
 
 /**
  * UI dialog options for extensions.
@@ -110,6 +130,17 @@ export interface ExtensionUIDialogOptions {
 	onExternalEditor?: () => void;
 	/** Optional footer hint text rendered by interactive selector */
 	helpText?: string;
+	/** Render a leading radio/checkbox marker before each markable option in
+	 *  select dialogs (matches the ask transcript). "radio" fills the cursor row
+	 *  for single-choice; "checkbox" reflects `checkedIndices` per row for
+	 *  multi-select. Options beyond `markableCount` keep the plain cursor. */
+	selectionMarker?: "radio" | "checkbox";
+	/** For `selectionMarker: "checkbox"`: option indices currently checked. */
+	checkedIndices?: readonly number[];
+	/** Number of leading options that receive a selection marker; the remaining
+	 *  trailing options (e.g. "Other"/"Done" actions) keep the plain cursor.
+	 *  Defaults to all options when `selectionMarker` is set. */
+	markableCount?: number;
 }
 
 /** Raw terminal input listener for extensions. */
@@ -135,8 +166,12 @@ export type ExtensionWidgetContent = string[] | ExtensionUiComponentFactory | un
 // and may be invoked from event handlers that have already taken the agent
 // loop's lock — hooks intentionally cannot.
 export interface ExtensionUIContext {
-	/** Show a selector and return the user's choice. */
-	select(title: string, options: string[], dialogOptions?: ExtensionUIDialogOptions): Promise<string | undefined>;
+	/** Show a selector and return the selected label, even when an option also includes a description. */
+	select(
+		title: string,
+		options: ExtensionUISelectItem[],
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<string | undefined>;
 
 	/** Show a confirmation dialog. */
 	confirm(title: string, message: string, dialogOptions?: ExtensionUIDialogOptions): Promise<boolean>;
@@ -363,6 +398,9 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	defaultInactive?: boolean;
 	/** If true, tool may stage deferred changes that require explicit resolve/discard. */
 	deferrable?: boolean;
+	/** Tool approval tier. Defaults to `"exec"` when omitted.
+	 *  `"read"`: read-only operations. `"write"`: mutations. `"exec"`: code execution. */
+	approval?: ToolApproval;
 	/** MCP server name for discovery/search metadata when this tool fronts an MCP server. */
 	mcpServerName?: string;
 	/** Original MCP tool name for discovery/search metadata. */
@@ -799,6 +837,18 @@ export type MessageRenderer<T = unknown> = (
 	theme: Theme,
 ) => Component | undefined;
 
+export interface AssistantThinkingRenderContext {
+	contentIndex: number;
+	thinkingIndex: number;
+	text: string;
+	requestRender(): void;
+}
+
+export type AssistantThinkingRenderer = (
+	context: AssistantThinkingRenderContext,
+	theme: Theme,
+) => Component | undefined;
+
 // ============================================================================
 // Command Registration
 // ============================================================================
@@ -830,13 +880,13 @@ export interface ExtensionAPI {
 	// =========================================================================
 
 	/** File logger for error/warning/debug messages */
-	logger: typeof import("@oh-my-pi/pi-utils").logger;
+	logger: typeof PiLogger;
 
 	/** Injected zod-backed typebox shim for legacy `Type.Object(...)` parameter authoring. */
-	typebox: typeof import("../typebox");
+	typebox: typeof TypeBox;
 
 	/** Injected zod module for Zod-authored extension tools (canonical going forward). */
-	zod: typeof import("zod/v4");
+	zod: typeof Zod;
 
 	/** Injected pi-coding-agent exports for accessing SDK utilities */
 	pi: typeof piCodingAgent;
@@ -949,6 +999,9 @@ export interface ExtensionAPI {
 
 	/** Register a custom renderer for CustomMessageEntry. */
 	registerMessageRenderer<T = unknown>(customType: string, renderer: MessageRenderer<T>): void;
+
+	/** Register a renderer for assistant thinking blocks. Rendered after the original thinking text. */
+	registerAssistantThinkingRenderer(renderer: AssistantThinkingRenderer): void;
 
 	// =========================================================================
 	// Actions
@@ -1081,6 +1134,13 @@ export interface ProviderConfig {
 		/** Optional model rewrite hook for credential-aware routing (e.g., enterprise URLs). */
 		modifyModels?(models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[];
 	};
+	/**
+	 * Async factory that fetches the live model list from the provider endpoint.
+	 * Runs through the same SQLite model-cache as built-in providers (keyed by
+	 * provider name, default 24 h TTL). Receives the resolved API key (undefined
+	 * when unauthenticated). Mutually exclusive with `models`.
+	 */
+	fetchDynamicModels?: (apiKey: string | undefined) => Promise<readonly ProviderModelConfig[]>;
 }
 
 /** Configuration for a model within a provider. */
@@ -1232,6 +1292,7 @@ export interface Extension {
 	label?: string;
 	handlers: Map<string, HandlerFn[]>;
 	tools: Map<string, RegisteredTool<any, any>>;
+	assistantThinkingRenderers: AssistantThinkingRenderer[];
 	messageRenderers: Map<string, MessageRenderer>;
 	commands: Map<string, RegisteredCommand>;
 	flags: Map<string, ExtensionFlag>;

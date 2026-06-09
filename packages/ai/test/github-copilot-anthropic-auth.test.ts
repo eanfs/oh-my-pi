@@ -1,13 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { buildAnthropicClientOptions, streamAnthropic } from "../src/providers/anthropic";
-import type { Context, Model } from "../src/types";
-import { buildAnthropicUrl } from "../src/utils/anthropic-auth";
-import { OPENCODE_HEADERS } from "../src/utils/oauth/github-copilot";
-
-const originalFetch = global.fetch;
+import { buildAnthropicClientOptions, streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
+import { OPENCODE_HEADERS } from "@oh-my-pi/pi-ai/registry/oauth/github-copilot";
+import type { Context, Model } from "@oh-my-pi/pi-ai/types";
+import { buildAnthropicUrl } from "@oh-my-pi/pi-ai/utils/anthropic-auth";
 
 afterEach(() => {
-	global.fetch = originalFetch;
 	vi.restoreAllMocks();
 });
 
@@ -24,6 +21,20 @@ function makeCopilotClaudeModel(): Model<"anthropic-messages"> {
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128000,
 		maxTokens: 16000,
+	};
+}
+function makeOpenCodeGoQwen37Model(): Model<"anthropic-messages"> {
+	return {
+		id: "qwen3.7-max",
+		name: "Qwen3.7 Max",
+		api: "anthropic-messages",
+		provider: "opencode-go",
+		baseUrl: "https://opencode.ai/zen/go",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_000_000,
+		maxTokens: 65_536,
 	};
 }
 
@@ -59,6 +70,44 @@ describe("Anthropic Copilot auth config", () => {
 
 		expect(options.apiKey).toBeNull();
 		expect(options.defaultHeaders.Authorization).toBe(`Bearer ${token}`);
+	});
+
+	it("uses X-Api-Key auth for OpenCode Go Anthropic models", () => {
+		const model = makeOpenCodeGoQwen37Model();
+		const token = "opencode_test_key";
+		const options = buildAnthropicClientOptions({
+			model,
+			apiKey: token,
+			extraBetas: [],
+			stream: true,
+			dynamicHeaders: {},
+		});
+
+		expect(options.apiKey).toBe(token);
+		expect(options.authToken).toBeNull();
+		expect(options.defaultHeaders.Authorization).toBeUndefined();
+	});
+
+	it("sends OpenCode Go Anthropic requests with X-Api-Key", async () => {
+		const requestedApiKeys: Array<string | null> = [];
+		const requestedAuthorizations: Array<string | null> = [];
+		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+			requestedApiKeys.push(getRequestHeader(input, init, "X-Api-Key"));
+			requestedAuthorizations.push(getRequestHeader(input, init, "Authorization"));
+			return new Response(JSON.stringify({ error: { type: "authentication_error", message: "Unauthorized" } }), {
+				status: 401,
+				headers: { "Content-Type": "application/json" },
+			});
+		});
+
+		const result = await streamAnthropic(makeOpenCodeGoQwen37Model(), testContext, {
+			apiKey: "opencode_test_key",
+			fetch: fetchMock as unknown as typeof fetch,
+		}).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(requestedApiKeys[0]).toBe("opencode_test_key");
+		expect(requestedAuthorizations[0]).toBeNull();
 	});
 
 	it("unwraps structured Copilot credentials before setting Authorization", () => {
@@ -187,17 +236,18 @@ describe("Anthropic Copilot auth config", () => {
 
 	it("forwards initiatorOverride to Copilot message requests", async () => {
 		const requestedInitiators: Array<string | null> = [];
-		global.fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
 			requestedInitiators.push(getRequestHeader(input, init, "X-Initiator"));
 			return new Response(JSON.stringify({ error: { type: "authentication_error", message: "Unauthorized" } }), {
 				status: 401,
 				headers: { "Content-Type": "application/json" },
 			});
-		}) as unknown as typeof fetch;
+		});
 
 		const model = makeCopilotClaudeModel();
 		const result = await streamAnthropic(model, testContext, {
 			apiKey: "ghu_test_copilot_token",
+			fetch: fetchMock as unknown as typeof fetch,
 			initiatorOverride: "agent",
 		}).result();
 

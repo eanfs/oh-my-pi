@@ -1,4 +1,5 @@
 import type { ZodType, z } from "zod/v4";
+import type { ApiKey } from "./auth-retry";
 import type { BedrockOptions } from "./providers/amazon-bedrock";
 import type { AnthropicOptions } from "./providers/anthropic";
 import type { AzureOpenAIResponsesOptions } from "./providers/azure-openai-responses";
@@ -27,9 +28,23 @@ import type { OllamaChatOptions } from "./providers/ollama";
 import type { OpenAICodexResponsesOptions } from "./providers/openai-codex-responses";
 import type { OpenAICompletionsOptions } from "./providers/openai-completions";
 import type { OpenAIResponsesOptions } from "./providers/openai-responses";
+import type { KnownProviderId } from "./registry";
 import type { AssistantMessageEventStream } from "./utils/event-stream";
 
 export type { AssistantMessageEventStream } from "./utils/event-stream";
+
+/**
+ * Ceiling on the output-token count omp requests from any OpenAI-family endpoint
+ * (openai-responses, azure/xai responses, and openai-completions). Mirrors
+ * Anthropic's {@link CLAUDE_CODE_MAX_OUTPUT_TOKENS}.
+ *
+ * Catalog `maxTokens` frequently reflects a model's context window rather than a
+ * given upstream's real per-request output cap. OpenRouter, for instance,
+ * advertises 131072 output tokens for `z-ai/glm-4.7`, but the Cerebras upstream
+ * only allows ~131072 tokens total — so requesting the full ceiling overflows
+ * with a 400. Requested output is clamped to this value (and to `model.maxTokens`).
+ */
+export const OPENAI_MAX_OUTPUT_TOKENS = 64000;
 
 export type KnownApi =
 	| "openai-completions"
@@ -95,63 +110,23 @@ export interface ThinkingConfig {
 	mode: ThinkingControlMode;
 }
 
-export type KnownProvider =
-	| "alibaba-coding-plan"
-	| "amazon-bedrock"
-	| "anthropic"
-	| "google"
-	| "google-gemini-cli"
-	| "google-antigravity"
-	| "google-vertex"
-	| "openai"
-	| "openai-codex"
-	| "kimi-code"
-	| "minimax-code"
-	| "minimax-code-cn"
-	| "github-copilot"
-	| "fireworks"
-	| "firepass"
-	| "gitlab-duo"
-	| "cursor"
-	| "deepseek"
-	| "xai"
-	| "xai-oauth"
-	| "groq"
-	| "cerebras"
-	| "openrouter"
-	| "kilo"
-	| "vercel-ai-gateway"
-	| "zai"
-	| "zhipu-coding-plan"
-	| "mistral"
-	| "minimax"
-	| "opencode-go"
-	| "opencode-zen"
-	| "synthetic"
-	| "cloudflare-ai-gateway"
-	| "huggingface"
-	| "litellm"
-	| "moonshot"
-	| "nvidia"
-	| "nanogpt"
-	| "ollama"
-	| "ollama-cloud"
-	| "qianfan"
-	| "qwen-portal"
-	| "together"
-	| "venice"
-	| "vllm"
-	| "xiaomi"
-	| "wafer-pass"
-	| "wafer-serverless"
-	| "zenmux"
-	| "lm-studio";
-export type Provider = KnownProvider | string;
+export type KnownProvider = KnownProviderId;
+// `Provider` is any provider-id string; `KnownProvider` enumerates the built-in model
+// providers. Kept structurally `string` (the prior `KnownProvider | string` already
+// collapsed to `string`) so the registry-derived `KnownProvider` can reference the model
+// types below without forming a circular type-alias reference.
+export type Provider = string;
 
-import type { Effort } from "./model-thinking";
+import type { Effort } from "./effort";
 
 /** Token budgets for each thinking level (token-based providers only) */
 export type ThinkingBudgets = { [key in Effort]?: number };
+
+export interface TokenTaskBudget {
+	type: "tokens";
+	total: number;
+	remaining?: number;
+}
 
 export type MessageAttribution = "user" | "agent";
 
@@ -289,12 +264,6 @@ export interface StreamOptions {
 	maxTokens?: number;
 	signal?: AbortSignal;
 	apiKey?: string;
-	/**
-	 * Called when a provider returns 401 before any replay-unsafe assistant
-	 * event has been emitted. Returning a different key retries the provider
-	 * request once.
-	 */
-	onAuthError?: (provider: string, apiKey: string, error: unknown) => Promise<string | undefined>;
 	cacheRetention?: CacheRetention;
 	/**
 	 * Additional headers to include in provider requests.
@@ -319,6 +288,11 @@ export interface StreamOptions {
 	 * For example, Anthropic uses `user_id` for abuse tracking and rate limiting.
 	 */
 	metadata?: Record<string, unknown>;
+	/**
+	 * Advisory token budget for a full agentic loop. Anthropic encodes this as
+	 * `output_config.task_budget` with the `task-budgets-2026-03-13` beta header.
+	 */
+	taskBudget?: TokenTaskBudget;
 	/**
 	 * Optional session identifier for providers that support session-based
 	 * routing, request affinity, or transport reuse. Providers may also use this
@@ -363,6 +337,11 @@ export interface StreamOptions {
 	 * `0` to disable both layers for this request. After the first semantic
 	 * event arrives, `streamIdleTimeoutMs` governs inter-event stalls. Falls
 	 * back to `PI_STREAM_FIRST_EVENT_TIMEOUT_MS` and then to a 100s default.
+	 * OpenAI-family transports additionally honor
+	 * `PI_OPENAI_STREAM_FIRST_EVENT_TIMEOUT_MS` as the most-specific override and
+	 * floor the first-event budget at the resolved idle (per-call
+	 * `streamIdleTimeoutMs` or `PI_OPENAI_STREAM_IDLE_TIMEOUT_MS`) so slow local
+	 * OpenAI-compatible servers are not undercut during prompt processing.
 	 *
 	 * Iterator-level honored by: every built-in provider (via the lazy-stream
 	 * forwarder in `register-builtins`). SDK-request honored by:
@@ -396,7 +375,15 @@ export interface StreamOptions {
 }
 
 // Unified options with reasoning passed to streamSimple() and completeSimple()
-export interface SimpleStreamOptions extends StreamOptions {
+export interface SimpleStreamOptions extends Omit<StreamOptions, "apiKey"> {
+	/**
+	 * API key for the request: either a static bearer string, or an
+	 * {@link ApiKeyResolver} that mints/rotates the key across the central
+	 * a/b/c auth-retry policy. `streamSimple`/`completeSimple` resolve a
+	 * resolver to a string before per-provider dispatch, so providers only
+	 * ever see the resolved {@link StreamOptions.apiKey} string.
+	 */
+	apiKey?: ApiKey;
 	reasoning?: Effort;
 	/**
 	 * Force-disable reasoning for the request even when the model supports it.
@@ -560,6 +547,8 @@ export interface UserMessage {
 	content: string | (TextContent | ImageContent)[];
 	/** True if the message was injected by the system (e.g., auto-continue). */
 	synthetic?: boolean;
+	/** True when injected mid-turn as a steer; consumed by the agent's pre-LLM transform to wrap it for emphasis. Never rendered. */
+	steering?: boolean;
 	/** Who initiated this message for billing/attribution semantics. */
 	attribution?: MessageAttribution;
 	/** Provider-specific opaque payload used to reconstruct transport-native history. */
@@ -584,6 +573,14 @@ export interface AssistantMessage {
 	provider: Provider;
 	model: string;
 	responseId?: string; // Provider-specific response/message identifier when the upstream API exposes one
+	/**
+	 * Name of the upstream provider an aggregator routed this request to, as
+	 * reported in the response (e.g. OpenRouter's top-level `provider` field:
+	 * `"OpenAI"`, `"Anthropic"`, `"Together"`). Distinct from `provider`, which
+	 * is the configured gateway we called (`"openrouter"`). Undefined for direct
+	 * providers that expose no such field.
+	 */
+	upstreamProvider?: string;
 	usage: Usage;
 	stopReason: StopReason;
 	errorMessage?: string;
@@ -768,6 +765,8 @@ export interface OpenAICompat {
 	requiresMistralToolIds?: boolean;
 	/** Format for reasoning/thinking parameter. "openai" uses reasoning_effort, "openrouter" uses reasoning: { effort }, "zai" uses thinking: { type: "enabled" | "disabled" } (also used by Moonshot Kimi), "qwen" uses top-level enable_thinking, and "qwen-chat-template" uses chat_template_kwargs.enable_thinking. Default: "openai". */
 	thinkingFormat?: "openai" | "openrouter" | "zai" | "qwen" | "qwen-chat-template";
+	/** Optional `thinking.keep` value for Z.ai/Moonshot-style thinking params. Set false to suppress auto-detected keep. Default: auto-detected. */
+	thinkingKeep?: "all" | false;
 	/** Which reasoning content field to emit on assistant messages. Default: auto-detected. */
 	reasoningContentField?: "reasoning_content" | "reasoning" | "reasoning_text";
 	/** Whether assistant tool-call messages must include reasoning content. Default: false. */
@@ -799,6 +798,8 @@ export interface OpenAICompat {
 	vercelGatewayRouting?: VercelGatewayRouting;
 	/** Extra fields to include in request body (e.g. gateway routing hints for OpenClaw-style proxies). */
 	extraBody?: Record<string, unknown>;
+	/** Whether chat-completions payloads should include provider-specific prompt-cache markers. */
+	cacheControlFormat?: "anthropic" | undefined;
 	/** Whether the provider supports the `strict` field in tool definitions. Default: auto-detected per provider/baseUrl (conservative for unknown providers). */
 	supportsStrictMode?: boolean;
 	/** Whether tool schemas must be sent either all strict or all non-strict. Undefined keeps the existing per-tool mixed behavior. */
@@ -880,6 +881,18 @@ export interface Model<TApi extends Api = any> {
 	premiumMultiplier?: number;
 	contextWindow: number;
 	maxTokens: number;
+	/**
+	 * When `true`, providers MUST omit `max_output_tokens` (Responses) /
+	 * `max_tokens` / `max_completion_tokens` (Completions) from the outbound
+	 * request and let the upstream API decide the per-response cap. `maxTokens`
+	 * is still used locally for budgeting (compaction, context promotion); only
+	 * the wire field is suppressed.
+	 *
+	 * Use this for proxies (notably Ollama) that forward to a backend whose true
+	 * output limit OMP cannot discover — sending the wrong value triggers 400s
+	 * from the upstream provider.
+	 */
+	omitMaxOutputTokens?: boolean;
 	headers?: Record<string, string>;
 	/**
 	 * Streaming transport override. When `"pi-native"`, `streamSimple` routes

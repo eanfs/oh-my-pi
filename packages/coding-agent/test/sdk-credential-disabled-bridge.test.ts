@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { AuthStorage, type CredentialDisabledEvent } from "@oh-my-pi/pi-ai";
-import * as oauthUtils from "@oh-my-pi/pi-ai/utils/oauth";
+import * as oauthUtils from "@oh-my-pi/pi-ai/oauth";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { Extension, ExtensionError, ExtensionFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
@@ -16,6 +16,10 @@ import { Snowflake } from "@oh-my-pi/pi-utils";
 interface SessionDirs {
 	cwd: string;
 	agentDir: string;
+}
+
+function emptyWorkspaceTree(cwd: string) {
+	return { rootPath: cwd, rendered: ".\n", truncated: false, totalLines: 1, agentsMdFiles: [] };
 }
 
 const expiredOAuth = () =>
@@ -89,12 +93,20 @@ describe("createAgentSession credential_disabled subscription", () => {
 		cwd: dirs.cwd,
 		agentDir: dirs.agentDir,
 		authStorage,
+		// Pin the model registry at a temp models.json. Without an explicit path, ModelRegistry
+		// loads the developer's real ~/.omp models config on every construction (~100ms each,
+		// and non-isolated). Pointing it at the (absent) temp file keeps construction at ~2ms and
+		// avoids leaking host config into the test. Providing the registry also skips the
+		// fire-and-forget background model discovery, which is irrelevant to credential_disabled.
+		modelRegistry: new ModelRegistry(authStorage, path.join(dirs.agentDir, "models.json")),
 		settings: Settings.isolated(),
 		disableExtensionDiscovery: true,
 		extensions,
 		skills: [],
+		rules: [],
 		contextFiles: [],
 		promptTemplates: [],
+		workspaceTree: emptyWorkspaceTree(dirs.cwd),
 		slashCommands: [],
 		enableMCP: false,
 		enableLsp: false,
@@ -401,7 +413,7 @@ describe("createAgentSession credential_disabled subscription", () => {
 				embedderEvents.push(event);
 			},
 		});
-		const modelRegistry = new ModelRegistry(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(dirs.agentDir, "models.json"));
 		const ext = makeRecordingExtension();
 
 		const { session } = await createAgentSession({
@@ -414,6 +426,7 @@ describe("createAgentSession credential_disabled subscription", () => {
 			skills: [],
 			contextFiles: [],
 			promptTemplates: [],
+			workspaceTree: emptyWorkspaceTree(dirs.cwd),
 			slashCommands: [],
 			enableMCP: false,
 			enableLsp: false,
@@ -442,7 +455,7 @@ describe("createAgentSession credential_disabled subscription", () => {
 		const dirs = makeDirs("mismatch");
 		const registryStorage = await AuthStorage.create(path.join(dirs.agentDir, "agent-registry.db"));
 		const otherStorage = await AuthStorage.create(path.join(dirs.agentDir, "agent-other.db"));
-		const modelRegistry = new ModelRegistry(registryStorage);
+		const modelRegistry = new ModelRegistry(registryStorage, path.join(dirs.agentDir, "models-registry.json"));
 
 		await expect(
 			createAgentSession({
@@ -456,6 +469,7 @@ describe("createAgentSession credential_disabled subscription", () => {
 				skills: [],
 				contextFiles: [],
 				promptTemplates: [],
+				workspaceTree: emptyWorkspaceTree(dirs.cwd),
 				slashCommands: [],
 				enableMCP: false,
 				enableLsp: false,
@@ -470,7 +484,7 @@ describe("createAgentSession credential_disabled subscription", () => {
 		// by one microtask so a sync onError() registration lands in time.
 		const dirs = makeDirs("error-routing");
 		const authStorage = await AuthStorage.create(path.join(dirs.agentDir, "agent.db"));
-		const modelRegistry = new ModelRegistry(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(dirs.agentDir, "models.json"));
 		try {
 			const throwingExtension: Extension = {
 				path: "test://throwing-credential-disabled",
@@ -486,6 +500,7 @@ describe("createAgentSession credential_disabled subscription", () => {
 					],
 				]),
 				tools: new Map(),
+				assistantThinkingRenderers: [],
 				messageRenderers: new Map(),
 				commands: new Map(),
 				flags: new Map(),

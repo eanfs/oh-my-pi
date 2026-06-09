@@ -153,9 +153,10 @@ export function formatDiagnostic(diagnostic: Diagnostic, filePath: string): stri
 const DIAG_PATH_RE = /^(.+?):(\d+:\d+\s+.*)$/;
 
 /**
- * Reformat pre-formatted diagnostic messages into grep-style directory/file groups.
+ * Reformat pre-formatted diagnostic messages into a multi-level, prefix-folded
+ * directory/file grouping (see `formatGroupedFiles`).
  * Input:  ["path:line:col [sev] msg", ...]
- * Output: "# dir/\n## file.ts\n  line:col [sev] msg"
+ * Output: "# pkg/src/\n## file.ts\n  line:col [sev] msg"
  *
  * Messages that don't match the expected format are appended ungrouped at the end.
  */
@@ -219,6 +220,27 @@ export function formatDiagnosticsSummary(diagnostics: Diagnostic[]): string {
 	if (counts.hint > 0) parts.push(`${counts.hint} hint(s)`);
 
 	return parts.length > 0 ? parts.join(", ") : "no issues";
+}
+
+export function summarizeDiagnosticMessages(messages: string[]): { summary: string; errored: boolean } {
+	const counts = { error: 0, warning: 0, info: 0, hint: 0 };
+	for (const message of messages) {
+		const match = message.match(/\[(error|warning|info|hint)\]/i);
+		if (!match) continue;
+		const key = match[1].toLowerCase() as keyof typeof counts;
+		counts[key] += 1;
+	}
+
+	const parts: string[] = [];
+	if (counts.error > 0) parts.push(`${counts.error} error(s)`);
+	if (counts.warning > 0) parts.push(`${counts.warning} warning(s)`);
+	if (counts.info > 0) parts.push(`${counts.info} info(s)`);
+	if (counts.hint > 0) parts.push(`${counts.hint} hint(s)`);
+
+	return {
+		summary: parts.length > 0 ? parts.join(", ") : "no issues",
+		errored: counts.error > 0,
+	};
 }
 
 // =============================================================================

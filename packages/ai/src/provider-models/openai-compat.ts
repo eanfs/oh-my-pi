@@ -1,7 +1,8 @@
+import { Effort } from "../effort";
 import type { ModelManagerOptions } from "../model-manager";
-import { Effort } from "../model-thinking";
 import { getBundledModels } from "../models";
-import type { Api, Model, ThinkingConfig } from "../types";
+import { getGitHubCopilotBaseUrl, OPENCODE_HEADERS, parseGitHubCopilotApiKey } from "../registry/oauth/github-copilot";
+import type { Api, FetchImpl, Model, Provider, ThinkingConfig } from "../types";
 import { isAnthropicOAuthToken, isRecord, toBoolean, toNumber, toPositiveNumber } from "../utils";
 import {
 	fetchOpenAICompatibleModels,
@@ -9,13 +10,13 @@ import {
 	type OpenAICompatibleModelRecord,
 } from "../utils/discovery/openai-compatible";
 import { toFireworksPublicModelId } from "../utils/fireworks-model-id";
-import { getGitHubCopilotBaseUrl, OPENCODE_HEADERS, parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { createBundledReferenceMap, createReferenceResolver } from "./bundled-references";
+import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "./discovery-constants";
 
 const MODELS_DEV_URL = "https://models.dev/api.json";
 const ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1";
 const ANTHROPIC_OAUTH_BETA =
-	"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05";
+	"claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advanced-tool-use-2025-11-20,effort-2025-11-24,extended-cache-ttl-2025-04-11";
 
 export interface ModelsDevModel {
 	id?: string;
@@ -55,7 +56,7 @@ function toInputCapabilities(value: unknown): ("text" | "image")[] {
 	return supportsImage ? ["text", "image"] : ["text"];
 }
 
-async function fetchModelsDevPayload(fetchImpl: typeof fetch = fetch): Promise<unknown> {
+async function fetchModelsDevPayload(fetchImpl: FetchImpl = fetch): Promise<unknown> {
 	const response = await fetchImpl(MODELS_DEV_URL, {
 		method: "GET",
 		headers: { Accept: "application/json" },
@@ -194,11 +195,12 @@ function toOllamaNativeBaseUrl(baseUrl: string): string {
 async function fetchOllamaNativeModels(
 	baseUrl: string,
 	resolveMetadata: (modelId: string) => Promise<OllamaResolvedMetadata>,
+	fetchImpl: FetchImpl = fetch,
 ): Promise<Model<"openai-responses">[] | null> {
 	const nativeBaseUrl = toOllamaNativeBaseUrl(baseUrl);
 	let response: Response;
 	try {
-		response = await fetch(`${nativeBaseUrl}/api/tags`, {
+		response = await fetchImpl(`${nativeBaseUrl}/api/tags`, {
 			method: "GET",
 			headers: { Accept: "application/json" },
 		});
@@ -242,6 +244,22 @@ async function fetchOllamaNativeModels(
 const OLLAMA_FALLBACK_CONTEXT_WINDOW = 128_000;
 /** Cap max output tokens at a value that matches OMP's other openai-responses defaults. */
 const OLLAMA_DEFAULT_MAX_TOKENS = 8192;
+/**
+ * Ollama's OpenAI-compatible `reasoning.effort` only accepts
+ * `high|medium|low|max|none`; passing OMP's `minimal`/`xhigh` levels verbatim
+ * makes the server reject the turn with HTTP 400 `invalid reasoning value`.
+ * Map the two unsupported levels onto the closest accepted ones (`low`/`max`).
+ */
+const OLLAMA_REASONING_EFFORT_MAP = { minimal: "low", xhigh: "max" } as const;
+
+/** Stamp the Ollama reasoning-effort map onto a reasoning-capable model. */
+function applyOllamaReasoningCompat(model: Model<"openai-responses">): void {
+	if (!model.reasoning) return;
+	model.compat = {
+		...model.compat,
+		reasoningEffortMap: { ...OLLAMA_REASONING_EFFORT_MAP, ...model.compat?.reasoningEffortMap },
+	};
+}
 
 interface OllamaResolvedMetadata {
 	contextWindow: number;
@@ -301,9 +319,10 @@ function getOllamaThinkingConfig(capabilities: string[] | undefined): ThinkingCo
 async function fetchOllamaShowMetadata(
 	nativeBaseUrl: string,
 	modelId: string,
+	fetchImpl: FetchImpl = fetch,
 ): Promise<OllamaShowMetadata | undefined> {
 	try {
-		const response = await fetch(`${nativeBaseUrl}/api/show`, {
+		const response = await fetchImpl(`${nativeBaseUrl}/api/show`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json", Accept: "application/json" },
 			body: JSON.stringify({ model: modelId }),
@@ -338,13 +357,16 @@ async function fetchOllamaShowMetadata(
  * cached so repeated `fetchDynamicModels` calls do not refetch; failed
  * lookups stay uncached so a later refresh can recover.
  */
-function createOllamaMetadataResolver(nativeBaseUrl: string): (modelId: string) => Promise<OllamaResolvedMetadata> {
+function createOllamaMetadataResolver(
+	nativeBaseUrl: string,
+	fetchImpl?: FetchImpl,
+): (modelId: string) => Promise<OllamaResolvedMetadata> {
 	const cache = new Map<string, Promise<OllamaResolvedMetadata>>();
 	return modelId => {
 		const cached = cache.get(modelId);
 		if (cached) return cached;
 		const pending = (async () => {
-			const metadata = await fetchOllamaShowMetadata(nativeBaseUrl, modelId);
+			const metadata = await fetchOllamaShowMetadata(nativeBaseUrl, modelId, fetchImpl);
 			if (!metadata) {
 				cache.delete(modelId);
 				return { contextWindow: OLLAMA_FALLBACK_CONTEXT_WINDOW, maxTokens: OLLAMA_DEFAULT_MAX_TOKENS };
@@ -423,9 +445,9 @@ function isLikelyNanoGptTextModelId(id: string): boolean {
 	return !NANO_GPT_NON_TEXT_MODEL_TOKENS.some(token => normalized.includes(token));
 }
 
-type SimpleProviderConfig = { apiKey?: string; baseUrl?: string };
+type SimpleProviderConfig = { apiKey?: string; baseUrl?: string; fetch?: FetchImpl };
 
-function createSimpleOpenAICompletionsOptions(
+export function createSimpleOpenAICompletionsOptions(
 	providerId: Parameters<typeof getBundledModels>[0],
 	defaultBaseUrl: string,
 	config?: SimpleProviderConfig,
@@ -446,6 +468,7 @@ function createSimpleOpenAICompletionsOptions(
 						const reference = references.get(defaults.id);
 						return mapWithBundledReference(entry, defaults, reference);
 					},
+					fetch: config?.fetch,
 				}),
 		}),
 	};
@@ -472,6 +495,7 @@ function createSimpleOpenAIResponsesOptions(
 						const reference = references.get(defaults.id);
 						return mapWithBundledReference(entry, defaults, reference);
 					},
+					fetch: config?.fetch,
 				}),
 		}),
 	};
@@ -504,6 +528,7 @@ function createSimpleAnthropicProviderOptions(
 							baseUrl,
 						};
 					},
+					fetch: config?.fetch,
 				}),
 		}),
 	};
@@ -516,6 +541,7 @@ function createSimpleAnthropicProviderOptions(
 export interface OpenAIModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function openaiModelManagerOptions(config?: OpenAIModelManagerConfig): ModelManagerOptions<"openai-responses"> {
@@ -536,6 +562,7 @@ export function openaiModelManagerOptions(config?: OpenAIModelManagerConfig): Mo
 						const reference = references.get(defaults.id);
 						return mapWithBundledReference(entry, defaults, reference);
 					},
+					fetch: config?.fetch,
 				}),
 		}),
 	};
@@ -548,6 +575,7 @@ export function openaiModelManagerOptions(config?: OpenAIModelManagerConfig): Mo
 export interface GroqModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function groqModelManagerOptions(config?: GroqModelManagerConfig): ModelManagerOptions<"openai-completions"> {
@@ -561,6 +589,7 @@ export function groqModelManagerOptions(config?: GroqModelManagerConfig): ModelM
 export interface CerebrasModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function cerebrasModelManagerOptions(
@@ -576,6 +605,7 @@ export function cerebrasModelManagerOptions(
 export interface HuggingfaceModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function huggingfaceModelManagerOptions(
@@ -591,6 +621,7 @@ export function huggingfaceModelManagerOptions(
 export interface NvidiaModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function nvidiaModelManagerOptions(
@@ -606,6 +637,7 @@ export function nvidiaModelManagerOptions(
 export interface XaiModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function xaiModelManagerOptions(config?: XaiModelManagerConfig): ModelManagerOptions<"openai-completions"> {
@@ -615,6 +647,7 @@ export function xaiModelManagerOptions(config?: XaiModelManagerConfig): ModelMan
 export interface XaiOAuthModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 interface XAICuratedModel {
@@ -844,12 +877,64 @@ export function xaiOAuthModelManagerOptions(
 }
 
 // ---------------------------------------------------------------------------
+// 6.4 AIML API
+// ---------------------------------------------------------------------------
+
+const AIML_API_NON_CHAT_MODEL_ID_PATTERN =
+	/(?:^|[/:._-])(?:audio|embed|embedding|embeddings|i2i|i2v|image|speech|t2i|t2v|tts|video)(?:$|[/:._-])/i;
+
+const AIML_API_NON_CHAT_MODEL_ID_SUBSTRINGS = ["dall-e", "dalle", "flux", "imagen", "sora", "veo", "whisper"] as const;
+
+export function isLikelyAimlApiChatModelId(id: string): boolean {
+	const normalized = id.trim().toLowerCase();
+	if (!normalized) return false;
+	return (
+		!AIML_API_NON_CHAT_MODEL_ID_PATTERN.test(normalized) &&
+		!AIML_API_NON_CHAT_MODEL_ID_SUBSTRINGS.some(token => normalized.includes(token))
+	);
+}
+
+export interface AimlApiModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+	fetch?: FetchImpl;
+}
+
+export function aimlApiModelManagerOptions(
+	config?: AimlApiModelManagerConfig,
+): ModelManagerOptions<"openai-completions"> {
+	const apiKey = config?.apiKey;
+	const baseUrl = config?.baseUrl ?? "https://api.aimlapi.com/v1";
+	const references = createBundledReferenceMap<"openai-completions">("aimlapi");
+	return {
+		providerId: "aimlapi",
+		dynamicModelsAuthoritative: true,
+		...(apiKey && {
+			fetchDynamicModels: () =>
+				fetchOpenAICompatibleModels({
+					api: "openai-completions",
+					provider: "aimlapi",
+					baseUrl,
+					apiKey,
+					filterModel: (_entry, model) => isLikelyAimlApiChatModelId(model.id),
+					mapModel: (entry, defaults) => {
+						const reference = references.get(defaults.id);
+						return mapWithBundledReference(entry, defaults, reference);
+					},
+					fetch: config?.fetch,
+				}),
+		}),
+	};
+}
+
+// ---------------------------------------------------------------------------
 // 6.5 DeepSeek
 // ---------------------------------------------------------------------------
 
 export interface DeepSeekModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function deepseekModelManagerOptions(
@@ -864,6 +949,7 @@ export function deepseekModelManagerOptions(
 export interface ZhipuCodingPlanModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function zhipuCodingPlanModelManagerOptions(
@@ -897,6 +983,7 @@ export function zhipuCodingPlanModelManagerOptions(
 							},
 						};
 					},
+					fetch: config?.fetch,
 				}),
 		}),
 	};
@@ -925,9 +1012,63 @@ const ZHIPU_VISION_PATTERN = /^glm-[45](?:\.\d+)?v(?:-|$)/;
 // 7.5 Fireworks
 // ---------------------------------------------------------------------------
 
+/**
+ * Fireworks-published cap for the Kimi K2 family. Fireworks' `/v1/models`
+ * envelope generically reports `max_completion_tokens: 65536` for every Kimi
+ * deployment, but Kimi K2 (instruct / thinking / turbo) on Fireworks is
+ * documented to ship long reasoning traces that should be bounded — capping
+ * at 32,768 prevents handing callers a budget the router cannot honor.
+ * See https://github.com/can1357/oh-my-pi/issues/1849.
+ */
+export const FIREWORKS_KIMI_MAX_TOKENS = 32_768;
+
+/**
+ * Returns true for any Kimi K2.x public model id served by Fireworks-backed
+ * providers (`fireworks` direct, `firepass` router). Matches both the public
+ * catalog id (`kimi-k2.5`, `kimi-k2.6`, `kimi-k2.6-turbo`) and the canonical
+ * Fireworks wire id (`accounts/fireworks/{models,routers}/kimi-k2…`).
+ */
+export function isFireworksKimiK2ModelId(modelId: string): boolean {
+	const trimmed = modelId.toLowerCase();
+	if (trimmed.startsWith("kimi-k2")) return true;
+	return /\/kimi-k2(?:p\d+)?(?:[._-]|$)/.test(trimmed);
+}
+
+/**
+ * Clamp the Kimi K2 family's `maxTokens` to {@link FIREWORKS_KIMI_MAX_TOKENS}
+ * on Fireworks-backed providers, leaving every other model untouched.
+ */
+export function clampFireworksKimiMaxTokens(modelId: string, candidate: number): number {
+	return isFireworksKimiK2ModelId(modelId) ? Math.min(candidate, FIREWORKS_KIMI_MAX_TOKENS) : candidate;
+}
+
+/**
+ * Fireworks DeepSeek V4 accepts effort via `reasoning_effort` but rejects the
+ * DeepSeek-native binary `thinking` toggle when both are present.
+ */
+export function stripFireworksDeepSeekThinkingToggle(
+	model: Model<"openai-completions">,
+	publicModelId: string,
+): Model<"openai-completions"> {
+	if (!publicModelId.startsWith("deepseek-v4")) return model;
+	const compat = model.compat;
+	if (!compat?.extraBody || !("thinking" in compat.extraBody)) return model;
+
+	const extraBody = { ...compat.extraBody };
+	delete extraBody.thinking;
+	if (Object.keys(extraBody).length > 0) {
+		return { ...model, compat: { ...compat, extraBody } };
+	}
+
+	const nextCompat = { ...compat };
+	delete nextCompat.extraBody;
+	return { ...model, compat: nextCompat };
+}
+
 export interface FireworksModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 function toFireworksModelName(entry: OpenAICompatibleModelRecord, fallback: string): string {
@@ -963,9 +1104,9 @@ function createModelsDevReferenceMap<TApi extends Api>(models: readonly Model<Ap
 	return references;
 }
 
-async function loadModelsDevReferences<TApi extends Api>(): Promise<Map<string, Model<TApi>>> {
+async function loadModelsDevReferences<TApi extends Api>(fetchImpl?: FetchImpl): Promise<Map<string, Model<TApi>>> {
 	try {
-		const payload = await fetchModelsDevPayload();
+		const payload = await fetchModelsDevPayload(fetchImpl);
 		return createModelsDevReferenceMap<TApi>(
 			mapModelsDevToModels(payload as Record<string, unknown>, MODELS_DEV_PROVIDER_DESCRIPTORS),
 		);
@@ -983,7 +1124,7 @@ export function fireworksModelManagerOptions(
 		providerId: "fireworks",
 		...(apiKey && {
 			fetchDynamicModels: async () => {
-				const modelsDevReferences = await loadModelsDevReferences<"openai-completions">();
+				const modelsDevReferences = await loadModelsDevReferences<"openai-completions">(config?.fetch);
 				return fetchOpenAICompatibleModels({
 					api: "openai-completions",
 					provider: "fireworks",
@@ -994,7 +1135,10 @@ export function fireworksModelManagerOptions(
 					mapModel: (entry, defaults) => {
 						const publicModelId = toFireworksPublicModelId(defaults.id);
 						const reference = modelsDevReferences.get(publicModelId) ?? bundledReferences(publicModelId);
-						const model = mapWithBundledReference(entry, defaults, reference);
+						const model = stripFireworksDeepSeekThinkingToggle(
+							mapWithBundledReference(entry, defaults, reference),
+							publicModelId,
+						);
 						return {
 							...model,
 							id: publicModelId,
@@ -1004,9 +1148,13 @@ export function fireworksModelManagerOptions(
 							name: toFireworksModelName(entry, model.name),
 							input: toBoolean(entry.supports_image_input) === true ? ["text", "image"] : ["text"],
 							contextWindow: toPositiveNumber(entry.context_length, model.contextWindow),
-							maxTokens: toPositiveNumber(entry.max_completion_tokens, model.maxTokens),
+							maxTokens: clampFireworksKimiMaxTokens(
+								publicModelId,
+								toPositiveNumber(entry.max_completion_tokens, model.maxTokens),
+							),
 						};
 					},
+					fetch: config?.fetch,
 				});
 			},
 		}),
@@ -1020,6 +1168,7 @@ export function fireworksModelManagerOptions(
 export interface FirepassModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 /**
@@ -1044,6 +1193,7 @@ export function firepassModelManagerOptions(
 export interface WaferModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 const WAFER_DEFAULT_BASE_URL = "https://pass.wafer.ai/v1";
@@ -1177,6 +1327,7 @@ function createWaferOptions(
 						return wafer?.tier === "pass_included";
 					},
 					mapModel: (entry, defaults) => mapWaferModel(providerId, baseUrl, entry, defaults),
+					fetch: config?.fetch,
 				}),
 		}),
 	};
@@ -1201,6 +1352,7 @@ export function waferServerlessModelManagerOptions(
 export interface MistralModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function mistralModelManagerOptions(
@@ -1216,6 +1368,7 @@ export function mistralModelManagerOptions(
 export interface OpenCodeModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 function normalizeOpenCodeBasePath(baseUrl: string | undefined, fallbackBasePath: string): string {
@@ -1263,6 +1416,7 @@ function openCodeModelManagerOptions(
 							maxTokens: toPositiveNumber(entry.max_completion_tokens, reference.maxTokens),
 						};
 					},
+					fetch: config?.fetch,
 				}),
 		}),
 	};
@@ -1283,6 +1437,7 @@ export function opencodeGoModelManagerOptions(config?: OpenCodeModelManagerConfi
 export interface OllamaModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function ollamaModelManagerOptions(config?: OllamaModelManagerConfig): ModelManagerOptions<"openai-responses"> {
@@ -1290,7 +1445,7 @@ export function ollamaModelManagerOptions(config?: OllamaModelManagerConfig): Mo
 	const baseUrl = normalizeOllamaBaseUrl(config?.baseUrl);
 	const nativeBaseUrl = toOllamaNativeBaseUrl(baseUrl);
 	const references = createBundledReferenceMap<"openai-responses">("ollama" as Parameters<typeof getBundledModels>[0]);
-	const resolveMetadata = createOllamaMetadataResolver(nativeBaseUrl);
+	const resolveMetadata = createOllamaMetadataResolver(nativeBaseUrl, config?.fetch);
 	return {
 		providerId: "ollama",
 		fetchDynamicModels: async () => {
@@ -1311,6 +1466,7 @@ export function ollamaModelManagerOptions(config?: OllamaModelManagerConfig): Mo
 					}
 					return mapWithBundledReference(entry, defaults, reference);
 				},
+				fetch: config?.fetch,
 			});
 			if (openAiCompatible && openAiCompatible.length > 0) {
 				await Promise.all(
@@ -1324,12 +1480,14 @@ export function ollamaModelManagerOptions(config?: OllamaModelManagerConfig): Mo
 						if (metadata.input) {
 							model.input = metadata.input;
 						}
+						applyOllamaReasoningCompat(model);
 					}),
 				);
 				return openAiCompatible;
 			}
-			const nativeFallback = await fetchOllamaNativeModels(baseUrl, resolveMetadata);
+			const nativeFallback = await fetchOllamaNativeModels(baseUrl, resolveMetadata, config?.fetch);
 			if (nativeFallback && nativeFallback.length > 0) {
+				for (const model of nativeFallback) applyOllamaReasoningCompat(model);
 				return nativeFallback;
 			}
 			return openAiCompatible;
@@ -1344,6 +1502,7 @@ export function ollamaModelManagerOptions(config?: OllamaModelManagerConfig): Mo
 export interface OpenRouterModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function openrouterModelManagerOptions(
@@ -1396,6 +1555,7 @@ export function openrouterModelManagerOptions(
 						}),
 					};
 				},
+				fetch: config?.fetch,
 			}),
 	};
 }
@@ -1467,6 +1627,7 @@ function getZenMuxCacheWritePrice(pricings: Record<string, unknown> | undefined)
 export interface ZenMuxModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function zenmuxModelManagerOptions(config?: ZenMuxModelManagerConfig): ModelManagerOptions<Api> {
@@ -1503,6 +1664,7 @@ export function zenmuxModelManagerOptions(config?: ZenMuxModelManagerConfig): Mo
 							maxTokens: toPositiveNumber(entry.max_completion_tokens, defaults.maxTokens),
 						};
 					},
+					fetch: config?.fetch,
 				}),
 		}),
 	};
@@ -1515,6 +1677,7 @@ export function zenmuxModelManagerOptions(config?: ZenMuxModelManagerConfig): Mo
 export interface KiloModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function kiloModelManagerOptions(config?: KiloModelManagerConfig): ModelManagerOptions<"openai-completions"> {
@@ -1528,6 +1691,7 @@ export function kiloModelManagerOptions(config?: KiloModelManagerConfig): ModelM
 				provider: "kilo",
 				baseUrl,
 				apiKey,
+				fetch: config?.fetch,
 			}),
 	};
 }
@@ -1539,6 +1703,7 @@ export function kiloModelManagerOptions(config?: KiloModelManagerConfig): ModelM
 export interface AlibabaCodingPlanModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function alibabaCodingPlanModelManagerOptions(
@@ -1559,6 +1724,7 @@ export function alibabaCodingPlanModelManagerOptions(
 					const reference = references.get(defaults.id);
 					return mapWithBundledReference(entry, defaults, reference);
 				},
+				fetch: config?.fetch,
 			}),
 	};
 }
@@ -1570,6 +1736,7 @@ export function alibabaCodingPlanModelManagerOptions(
 export interface VercelAiGatewayModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 function normalizeVercelAiGatewayBaseUrls(rawBaseUrl: string | undefined): { baseUrl: string; catalogBaseUrl: string } {
@@ -1623,6 +1790,7 @@ export function vercelAiGatewayModelManagerOptions(
 						maxTokens: typeof entry.max_tokens === "number" ? entry.max_tokens : defaults.maxTokens,
 					};
 				},
+				fetch: config?.fetch,
 			}),
 	};
 }
@@ -1634,6 +1802,7 @@ export function vercelAiGatewayModelManagerOptions(
 export interface KimiCodeModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function kimiCodeModelManagerOptions(
@@ -1674,6 +1843,7 @@ export function kimiCodeModelManagerOptions(
 							},
 						};
 					},
+					fetch: config?.fetch,
 				}),
 		}),
 	};
@@ -1686,6 +1856,7 @@ export function kimiCodeModelManagerOptions(
 export interface LmStudioModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function lmStudioModelManagerOptions(
@@ -1706,6 +1877,7 @@ export function lmStudioModelManagerOptions(
 					const reference = references.get(defaults.id);
 					return mapWithBundledReference(entry, defaults, reference);
 				},
+				fetch: config?.fetch,
 			}),
 	};
 }
@@ -1717,6 +1889,7 @@ export function lmStudioModelManagerOptions(
 export interface SyntheticModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function syntheticModelManagerOptions(
@@ -1756,6 +1929,7 @@ export function syntheticModelManagerOptions(
 							maxTokens: toPositiveNumber(entry.max_tokens, reference?.maxTokens ?? 8192),
 						};
 					},
+					fetch: config?.fetch,
 				}),
 		}),
 	};
@@ -1768,6 +1942,7 @@ export function syntheticModelManagerOptions(
 export interface VeniceModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function veniceModelManagerOptions(
@@ -1792,6 +1967,7 @@ export function veniceModelManagerOptions(
 						compat: { ...model.compat, supportsUsageInStreaming: false },
 					};
 				},
+				fetch: config?.fetch,
 			}),
 	};
 }
@@ -1803,6 +1979,7 @@ export function veniceModelManagerOptions(
 export interface TogetherModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function togetherModelManagerOptions(
@@ -1818,6 +1995,7 @@ export function togetherModelManagerOptions(
 export interface MoonshotModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function moonshotModelManagerOptions(
@@ -1839,14 +2017,26 @@ export function moonshotModelManagerOptions(
 						const reference = references.get(defaults.id);
 						const model = mapWithBundledReference(entry, defaults, reference);
 						const id = model.id.toLowerCase();
-						const isThinking = id.includes("thinking");
-						const isVision = id.includes("vision") || id.includes("vl") || id.includes("k2.5");
+						// Moonshot's K2.x family (K2.5, K2.6, kimi-k2-thinking, …) is reasoning-capable
+						// and vision-capable on the native API. Without these flags the openai-completions
+						// path skips the z.ai-format `thinking` block, and Moonshot K2.6 stalls on first
+						// turn because its endpoint expects an explicit `thinking: {type}` (#2113). Match
+						// the bundled K2.5 metadata for every K2.x id we discover.
+						const isKimiK2Reasoning = id.includes("thinking") || /(^|\/)kimi-k2(?:\.\d+)?(?:[-:]|$)/.test(id);
+						const isVision =
+							id.includes("vision") || id.includes("vl") || /(^|\/)kimi-k2(?:\.\d+)?(?:[-:]|$)/.test(id);
 						return {
 							...model,
-							reasoning: isThinking || model.reasoning,
+							reasoning: isKimiK2Reasoning || model.reasoning,
 							input: isVision ? ["text", "image"] : model.input,
+							thinking:
+								model.thinking ??
+								(isKimiK2Reasoning
+									? { mode: "effort", minLevel: Effort.Minimal, maxLevel: Effort.High }
+									: undefined),
 						};
 					},
+					fetch: config?.fetch,
 				}),
 		}),
 	};
@@ -1859,6 +2049,7 @@ export function moonshotModelManagerOptions(
 export interface QwenPortalModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function qwenPortalModelManagerOptions(
@@ -1874,6 +2065,7 @@ export function qwenPortalModelManagerOptions(
 export interface QianfanModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function qianfanModelManagerOptions(
@@ -1889,6 +2081,7 @@ export function qianfanModelManagerOptions(
 export interface CloudflareAiGatewayModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function cloudflareAiGatewayModelManagerOptions(
@@ -1905,33 +2098,50 @@ export function cloudflareAiGatewayModelManagerOptions(
 // 20. Xiaomi
 // ---------------------------------------------------------------------------
 
+/** Region codes for Xiaomi Token Plan clusters exposed as separate login providers. */
+export type XiaomiTokenPlanRegion = "sgp" | "ams" | "cn";
+
+/** Configures Xiaomi standard or regional Token Plan OpenAI-compatible model discovery. */
 export interface XiaomiModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
+	providerId?: Provider;
+	tokenPlanRegion?: XiaomiTokenPlanRegion;
 }
 
+const XIAOMI_TOKEN_PLAN_BASE_URLS: Record<XiaomiTokenPlanRegion, string> = {
+	sgp: "https://token-plan-sgp.xiaomimimo.com/v1",
+	ams: "https://token-plan-ams.xiaomimimo.com/v1",
+	cn: "https://token-plan-cn.xiaomimimo.com/v1",
+};
+
+const XIAOMI_TOKEN_PLAN_FALLBACK_BASE_URLS = [
+	XIAOMI_TOKEN_PLAN_BASE_URLS.sgp,
+	XIAOMI_TOKEN_PLAN_BASE_URLS.ams,
+	XIAOMI_TOKEN_PLAN_BASE_URLS.cn,
+];
+
+/** Builds a Xiaomi model manager, preserving Token Plan region provider ids during discovery. */
 export function xiaomiModelManagerOptions(
 	config?: XiaomiModelManagerConfig,
 ): ModelManagerOptions<"openai-completions"> {
 	const apiKey = config?.apiKey;
-	// Xiaomi splits API keys across two backends: standard `sk-` keys hit
-	// api.xiaomimimo.com; "token plan" `tp-` keys are scoped to a regional
-	// cluster and are tried in order until discovery succeeds.
-	const TOKEN_PLAN_BASE_URLS = [
-		"https://token-plan-sgp.xiaomimimo.com/v1",
-		"https://token-plan-ams.xiaomimimo.com/v1",
-		"https://token-plan-cn.xiaomimimo.com/v1",
-	] as const;
-	const STANDARD_BASE_URL = "https://api.xiaomimimo.com/v1";
-	const isTokenPlanKey = apiKey?.startsWith("tp-");
+	const providerId = config?.providerId ?? "xiaomi";
+	const tokenPlanBaseUrls = config?.tokenPlanRegion
+		? [XIAOMI_TOKEN_PLAN_BASE_URLS[config.tokenPlanRegion]]
+		: XIAOMI_TOKEN_PLAN_FALLBACK_BASE_URLS;
+	const XIAOMI_STANDARD_BASE_URL = "https://api.xiaomimimo.com/v1";
+	const isTokenPlanProvider = config?.tokenPlanRegion !== undefined || providerId.startsWith("xiaomi-token-plan-");
+	const isTokenPlanKey = isTokenPlanProvider || apiKey?.startsWith("tp-");
 	// Token-plan keys always use a TP cluster; config?.baseUrl (from catalog)
 	// would incorrectly pin to the standard endpoint (api.xiaomimimo.com).
-	const baseUrl = isTokenPlanKey ? TOKEN_PLAN_BASE_URLS[0] : (config?.baseUrl ?? STANDARD_BASE_URL);
+	const baseUrl = isTokenPlanKey ? tokenPlanBaseUrls[0] : (config?.baseUrl ?? XIAOMI_STANDARD_BASE_URL);
 	const references = createBundledReferenceMap<"openai-completions">("xiaomi");
 	const fetchModels = (url: string) =>
 		fetchOpenAICompatibleModels({
 			api: "openai-completions",
-			provider: "xiaomi",
+			provider: providerId,
 			baseUrl: url,
 			apiKey,
 			filterModel: (_entry, model) => !model.id.includes("-tts"),
@@ -1940,18 +2150,22 @@ export function xiaomiModelManagerOptions(
 				const model = mapWithBundledReference(entry, defaults, reference);
 				return {
 					...model,
+					api: "openai-completions",
+					provider: providerId,
+					baseUrl: defaults.baseUrl,
 					name: toModelName(entry.display_name, model.name),
 				};
 			},
+			fetch: config?.fetch,
 		});
 	return {
-		providerId: "xiaomi",
+		providerId,
 		...(apiKey && {
 			fetchDynamicModels: async () => {
 				if (!isTokenPlanKey) {
 					return fetchModels(baseUrl);
 				}
-				for (const url of TOKEN_PLAN_BASE_URLS) {
+				for (const url of tokenPlanBaseUrls) {
 					const result = await fetchModels(url);
 					if (result) return result;
 				}
@@ -1967,6 +2181,7 @@ export function xiaomiModelManagerOptions(
 export interface LiteLLMModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function litellmModelManagerOptions(
@@ -1974,20 +2189,25 @@ export function litellmModelManagerOptions(
 ): ModelManagerOptions<"openai-completions"> {
 	const apiKey = config?.apiKey;
 	const baseUrl = config?.baseUrl ?? "http://localhost:4000/v1";
-	const references = createBundledReferenceMap<"openai-completions">("litellm");
 	return {
 		providerId: "litellm",
-		fetchDynamicModels: () =>
-			fetchOpenAICompatibleModels({
+		// litellm is a local-only proxy whose /v1/models returns bare ids with no
+		// metadata, and it is never bundled in models.json (that would leak the
+		// machine's localhost catalog). It proxies known upstream models, so we
+		// enrich discovered ids against models.dev — the same reference source the
+		// gateway providers (fireworks et al.) use — instead of a bundled map.
+		fetchDynamicModels: async () => {
+			const modelsDevReferences = await loadModelsDevReferences<"openai-completions">(config?.fetch);
+			return fetchOpenAICompatibleModels({
 				api: "openai-completions",
 				provider: "litellm",
 				baseUrl,
 				apiKey,
-				mapModel: (entry, defaults) => {
-					const reference = references.get(defaults.id);
-					return mapWithBundledReference(entry, defaults, reference);
-				},
-			}),
+				mapModel: (entry, defaults) =>
+					mapWithBundledReference(entry, defaults, modelsDevReferences.get(defaults.id)),
+				fetch: config?.fetch,
+			});
+		},
 	};
 }
 
@@ -1998,6 +2218,7 @@ export function litellmModelManagerOptions(
 export interface VllmModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function vllmModelManagerOptions(config?: VllmModelManagerConfig): ModelManagerOptions<"openai-completions"> {
@@ -2019,6 +2240,7 @@ export function vllmModelManagerOptions(config?: VllmModelManagerConfig): ModelM
 						contextWindow: toPositiveNumber(entry.max_model_len, model.contextWindow),
 					};
 				},
+				fetch: config?.fetch,
 			}),
 	};
 }
@@ -2030,6 +2252,7 @@ export function vllmModelManagerOptions(config?: VllmModelManagerConfig): ModelM
 export interface NanoGptModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function nanoGptModelManagerOptions(
@@ -2064,6 +2287,7 @@ export function nanoGptModelManagerOptions(
 						}
 						return isLikelyNanoGptTextModelId(model.id);
 					},
+					fetch: config?.fetch,
 				});
 				if (!models) return null;
 				// Mark base models as reasoning-capable when a :thinking variant existed.
@@ -2085,6 +2309,7 @@ export function nanoGptModelManagerOptions(
 export interface GithubCopilotModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 function inferCopilotApi(modelId: string): Api {
@@ -2215,6 +2440,7 @@ export function githubCopilotModelManagerOptions(config?: GithubCopilotModelMana
 								: {}),
 						};
 					},
+					fetch: config?.fetch,
 				}),
 		}),
 	};
@@ -2227,6 +2453,7 @@ export function githubCopilotModelManagerOptions(config?: GithubCopilotModelMana
 export interface AnthropicModelManagerConfig {
 	apiKey?: string;
 	baseUrl?: string;
+	fetch?: FetchImpl;
 }
 
 export function anthropicModelManagerOptions(
@@ -2237,12 +2464,12 @@ export function anthropicModelManagerOptions(
 	return {
 		providerId: "anthropic",
 		modelsDev: {
-			fetch: fetchModelsDevPayload,
+			fetch: () => fetchModelsDevPayload(config?.fetch),
 			map: payload => mapAnthropicModelsDev(payload, baseUrl),
 		},
 		...(apiKey && {
 			fetchDynamicModels: async () => {
-				const modelsDevModels = await fetchModelsDevPayload()
+				const modelsDevModels = await fetchModelsDevPayload(config?.fetch)
 					.then(payload => mapAnthropicModelsDev(payload, baseUrl))
 					.catch(() => []);
 				const references = buildAnthropicReferenceMap(modelsDevModels);
@@ -2274,6 +2501,7 @@ export function anthropicModelManagerOptions(
 								baseUrl,
 							};
 						},
+						fetch: config?.fetch,
 					}) ?? null
 				);
 			},
@@ -2285,8 +2513,7 @@ export function anthropicModelManagerOptions(
 // Models.dev provider descriptors for generate-models.ts
 // ---------------------------------------------------------------------------
 
-export const UNK_CONTEXT_WINDOW = 222_222;
-export const UNK_MAX_TOKENS = 8_888;
+export { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "./discovery-constants";
 
 /** Describes how to map models.dev API data for a single provider. */
 export interface ModelsDevProviderDescriptor {
@@ -2471,19 +2698,32 @@ function createOpenCodeApiResolution(
 	};
 }
 
-const OPENCODE_ZEN_API_RESOLUTION = createOpenCodeApiResolution("https://opencode.ai/zen");
+// OpenCode Zen: models.dev declares minimax-m3-free (and forward-compat
+// minimax-m3) with `provider.npm = "@ai-sdk/anthropic"`, but the Zen gateway
+// only serves them at https://opencode.ai/zen/v1/chat/completions (verified
+// against the live /v1/models response — minimax-m3-free is listed there, and
+// the gateway has no /v1/messages route for it). Without this override the
+// resolver POSTs anthropic-shaped requests to /v1/messages and the UI surfaces
+// raw <invoke>/<|minimax|>/<tool_call> markup (#1617).
+const OPENCODE_ZEN_API_RESOLUTION = createOpenCodeApiResolution("https://opencode.ai/zen", {
+	"minimax-m3": "openai-completions",
+	"minimax-m3-free": "openai-completions",
+});
 // OpenCode Go: models.dev declares minimax-m2.7 / qwen3.5-plus / qwen3.6-plus
-// with `provider.npm = "@ai-sdk/anthropic"`, but the OpenCode Go gateway only
-// serves them at `https://opencode.ai/zen/go/v1/chat/completions` (verified
-// against https://opencode.ai/zen/go/v1/models and the upstream endpoint
-// table at https://opencode.ai/docs/go/#endpoints — minimax-m2.5 works the
-// same way and lacks an `npm` field on models.dev so it already falls through
-// to the openai-completions default). Without this override the resolver
-// would POST anthropic-style requests to /v1/messages and the gateway would
-// return its `Page Not Found` HTML (issue #887). Override the resolver so
-// regenerating models.json keeps the correct routing.
+// (and now also minimax-m3) with `provider.npm = "@ai-sdk/anthropic"`, but
+// the OpenCode Go gateway only serves them at
+// `https://opencode.ai/zen/go/v1/chat/completions` (verified against
+// https://opencode.ai/zen/go/v1/models and the upstream endpoint table at
+// https://opencode.ai/docs/go/#endpoints — minimax-m2.5 works the same way
+// and lacks an `npm` field on models.dev so it already falls through to the
+// openai-completions default). Without this override the resolver would POST
+// anthropic-style requests to /v1/messages and the gateway would return its
+// `Page Not Found` HTML (issue #887 for the qwen/m2.7 entries; minimax-m3
+// and minimax-m3-free added under #1617 for the same root cause).
 const OPENCODE_GO_API_RESOLUTION = createOpenCodeApiResolution("https://opencode.ai/zen/go", {
 	"minimax-m2.7": "openai-completions",
+	"minimax-m3": "openai-completions",
+	"minimax-m3-free": "openai-completions",
 	"qwen3.5-plus": "openai-completions",
 	"qwen3.6-plus": "openai-completions",
 });

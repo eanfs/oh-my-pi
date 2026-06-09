@@ -2,6 +2,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "bu
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import type { ModelRegistry, ProviderDiscoveryState } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { ModelRegistry as ModelRegistryImpl } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -9,13 +10,10 @@ import { ModelSelectorComponent } from "@oh-my-pi/pi-coding-agent/modes/componen
 import { getThemeByName, setThemeInstance } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import type { TUI } from "@oh-my-pi/pi-tui";
-import { hookFetch, Snowflake } from "@oh-my-pi/pi-utils";
+import { Snowflake } from "@oh-my-pi/pi-utils";
 
 function normalizeRenderedText(text: string): string {
-	return text
-		.replace(/\x1b\[[0-9;]*m/g, "")
-		.replace(/\s+/g, " ")
-		.trim();
+	return stripVTControlCharacters(text).replace(/\s+/g, " ").trim();
 }
 
 let testTheme = await getThemeByName("dark");
@@ -103,7 +101,10 @@ describe("issue #970 custom provider discovery", () => {
 			].join("\n"),
 		);
 
-		using _hook = hookFetch((input, init) => {
+		const fetchMock: (input: string | URL | Request, init?: RequestInit) => Promise<Response> = async (
+			input,
+			init,
+		) => {
 			const url = String(input);
 			if (url !== "http://192.168.5.3:8085/v1/models") {
 				throw new Error(`Unexpected URL: ${url}`);
@@ -115,9 +116,9 @@ describe("issue #970 custom provider discovery", () => {
 				status: 200,
 				headers: { "Content-Type": "application/json" },
 			});
-		});
+		};
 
-		const registry = new ModelRegistryImpl(authStorage, modelsPath);
+		const registry = new ModelRegistryImpl(authStorage, modelsPath, { fetch: fetchMock });
 		await registry.refreshProvider("vllm");
 
 		const providerModels = registry.getAll().filter(model => model.provider === "vllm");
@@ -136,7 +137,7 @@ describe("issue #970 custom provider discovery", () => {
 		expect(deepseek?.provider).toBe("vllm");
 		expect(deepseek?.name).toBe("deepseek-r1");
 		expect(deepseek?.contextWindow).toBe(128000);
-		expect(deepseek?.maxTokens).toBe(8192);
+		expect(deepseek?.maxTokens).toBe(32_768);
 	});
 
 	test("shows a provider-tab hint when discovery succeeds but returns zero models", async () => {

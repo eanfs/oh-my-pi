@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getOAuthProviders } from "@oh-my-pi/pi-ai/utils/oauth";
+import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { Snowflake, setProjectDir } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 import type { SettingPath, SettingValue } from "../config/settings";
@@ -21,6 +21,8 @@ import {
 } from "../extensibility/plugins/marketplace";
 import { resolveMemoryBackend } from "../memory-backend";
 import type { InteractiveModeContext } from "../modes/types";
+import type { FreshSessionResult } from "../session/agent-session";
+import { formatShakeSummary, type ShakeMode } from "../session/shake-types";
 import { getChangelogPath, parseChangelog } from "../utils/changelog";
 import { buildContextReportText } from "./helpers/context-report";
 import { formatDuration } from "./helpers/format";
@@ -51,11 +53,24 @@ function refreshStatusLine(ctx: InteractiveModeContext): void {
 	ctx.ui.requestRender();
 }
 
+function formatFreshSessionResult(result: FreshSessionResult): string {
+	const stateLabel = result.closedProviderSessions === 1 ? "provider state" : "provider states";
+	return `Fresh provider session started (${result.closedProviderSessions} ${stateLabel} pruned).`;
+}
+
 const shutdownHandlerTui = (_command: ParsedSlashCommand, runtime: TuiSlashCommandRuntime): SlashCommandResult => {
 	runtime.ctx.editor.setText("");
 	void runtime.ctx.shutdown();
 	return commandConsumed();
 };
+
+/** Parse the `/shake` subcommand into a {@link ShakeMode}; empty defaults to elide. */
+function parseShakeMode(args: string): ShakeMode | { error: string } {
+	const verb = args.trim().toLowerCase();
+	if (verb === "" || verb === "elide") return "elide";
+	if (verb === "images") return "images";
+	return { error: `Unknown /shake mode "${verb}". Use elide or images.` };
+}
 
 const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	{
@@ -82,6 +97,14 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			if (hadArgs && wasPlanModeEnabled) {
 				runtime.ctx.editor.addToHistory(command.text);
 			}
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "plan-review",
+		description: "Re-open the plan review for the latest plan (plan mode only)",
+		handleTui: async (_command, runtime) => {
+			await runtime.ctx.openPlanReview();
 			runtime.ctx.editor.setText("");
 		},
 	},
@@ -383,17 +406,9 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	},
 	{
 		name: "copy",
-		description: "Copy last agent message to clipboard",
-		subcommands: [
-			{ name: "last", description: "Copy full last agent message" },
-			{ name: "code", description: "Copy last code block" },
-			{ name: "all", description: "Copy all code blocks from last message" },
-			{ name: "cmd", description: "Copy last bash/python command" },
-		],
-		allowArgs: true,
-		handleTui: async (command, runtime) => {
-			const sub = command.args.trim().toLowerCase() || undefined;
-			await runtime.ctx.handleCopyCommand(sub);
+		description: "Pick text or code from the conversation to copy",
+		handleTui: (_command, runtime) => {
+			runtime.ctx.showCopySelector();
 			runtime.ctx.editor.setText("");
 		},
 	},
@@ -770,6 +785,25 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "fresh",
+		description: "Reset provider stream state without changing the local transcript",
+		handle: async (_command, runtime) => {
+			const result = runtime.session.freshSession();
+			if (!result) {
+				await runtime.output(
+					"Wait for the current response to finish or abort it before refreshing provider state.",
+				);
+				return commandConsumed();
+			}
+			await runtime.output(formatFreshSessionResult(result));
+			return commandConsumed();
+		},
+		handleTui: async (_command, runtime) => {
+			runtime.ctx.editor.setText("");
+			await runtime.ctx.handleFreshCommand();
+		},
+	},
+	{
 		name: "drop",
 		description: "Delete the current session and start a new one",
 		handleTui: async (_command, runtime) => {
@@ -811,27 +845,30 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
-		name: "drop-images",
-		description: "Strip every image from this session's history",
-		acpDescription: "Drop all images from the conversation history",
-		handle: async (_command, runtime) => {
-			const { removed } = await runtime.session.dropImages();
-			await runtime.output(
-				removed === 0
-					? "No images found in this session."
-					: `Dropped ${removed} image${removed === 1 ? "" : "s"} from this session.`,
-			);
+		name: "shake",
+		description: "Drop heavy content from context (tool results, large blocks)",
+		acpDescription: "Shake heavy content out of the conversation context",
+		subcommands: [
+			{ name: "elide", description: "Strip tool results + large blocks (default)" },
+			{ name: "images", description: "Strip image blocks" },
+		],
+		acpInputHint: "[elide|images]",
+		allowArgs: true,
+		handle: async (command, runtime) => {
+			const mode = parseShakeMode(command.args);
+			if (typeof mode !== "string") return usage(mode.error, runtime);
+			const result = await runtime.session.shake(mode);
+			await runtime.output(formatShakeSummary(result));
 			return commandConsumed();
 		},
-		handleTui: async (_command, runtime) => {
+		handleTui: async (command, runtime) => {
 			runtime.ctx.editor.setText("");
-			const { removed } = await runtime.ctx.session.dropImages();
-			if (removed === 0) {
-				runtime.ctx.showStatus("No images found in this session.");
+			const mode = parseShakeMode(command.args);
+			if (typeof mode !== "string") {
+				runtime.ctx.showWarning(mode.error);
 				return;
 			}
-			runtime.ctx.rebuildChatFromMessages();
-			runtime.ctx.showStatus(`Dropped ${removed} image${removed === 1 ? "" : "s"} from this session.`);
+			await runtime.ctx.handleShakeCommand(mode);
 		},
 	},
 	{
@@ -865,6 +902,17 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "tan",
+		description: "Run a full background agent on tangential work",
+		inlineHint: "<work>",
+		allowArgs: true,
+		handleTui: async (command, runtime) => {
+			const work = command.text.slice(`/${command.name}`.length).trim();
+			runtime.ctx.editor.setText("");
+			await runtime.ctx.handleTanCommand(work);
+		},
+	},
+	{
 		name: "omfg",
 		description: "Forge a TTSR rule from a complaint to stop a recurring behavior",
 		inlineHint: "<complaint>",
@@ -884,15 +932,6 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				runtime.ctx.showStatus("Nothing to retry");
 			}
 			runtime.ctx.editor.setText("");
-		},
-	},
-	{
-		name: "background",
-		aliases: ["bg"],
-		description: "Detach UI and continue running in background",
-		handleTui: (_command, runtime) => {
-			runtime.ctx.editor.setText("");
-			runtime.handleBackgroundCommand();
 		},
 	},
 	{
@@ -930,7 +969,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		allowArgs: true,
 		handle: async (command, runtime) => {
 			const verb = (command.args.trim().split(/\s+/)[0] ?? "").toLowerCase() || "view";
-			const backend = resolveMemoryBackend(runtime.settings);
+			const backend = await resolveMemoryBackend(runtime.settings);
 			switch (verb) {
 				case "view": {
 					const payload = await backend.buildDeveloperInstructions(

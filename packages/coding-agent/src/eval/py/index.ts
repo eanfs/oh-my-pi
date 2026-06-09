@@ -1,5 +1,10 @@
 import type { ToolSession } from "../../tools";
-import type { ExecutorBackend, ExecutorBackendExecOptions, ExecutorBackendResult } from "../backend";
+import {
+	type ExecutorBackend,
+	type ExecutorBackendExecOptions,
+	type ExecutorBackendResult,
+	resolveEvalUrlRoots,
+} from "../backend";
 import { executePython, type PythonExecutorOptions } from "./executor";
 import { checkPythonKernelAvailability } from "./kernel";
 
@@ -28,17 +33,19 @@ export default {
 		const kernelMode = readSetting<PythonExecutorOptions["kernelMode"]>(opts.session, "python.kernelMode");
 		const executorOptions: PythonExecutorOptions = {
 			cwd: opts.cwd,
-			deadlineMs: opts.deadlineMs,
+			idleTimeoutMs: opts.idleTimeoutMs,
 			signal: opts.signal,
 			sessionId: namespaceSessionId(opts.sessionId),
 			kernelMode,
 			sessionFile: opts.sessionFile,
 			artifactsDir: opts.session.getArtifactsDir?.() ?? undefined,
+			localRoots: resolveEvalUrlRoots(opts.session),
 			kernelOwnerId: opts.kernelOwnerId,
 			reset: opts.reset,
 			artifactPath: opts.artifactPath,
 			artifactId: opts.artifactId,
 			onChunk: opts.onChunk,
+			onStatus: opts.onStatus,
 			toolSession: opts.session,
 		};
 		const result = await executePython(code, executorOptions);

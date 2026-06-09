@@ -39,7 +39,7 @@ function createContext(options: {
 		isInitialized: true,
 		statusLine: { invalidate: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
-		ui: { requestRender: vi.fn() },
+		ui: { requestRender: vi.fn(), setEagerNativeScrollbackRebuild: vi.fn() },
 		editor,
 		addMessageToChat,
 		updatePendingMessagesDisplay,
@@ -52,6 +52,7 @@ function createContext(options: {
 						.join(""),
 		optimisticUserMessageSignature: options.optimisticSignature,
 		locallySubmittedUserSignatures: new Set<string>(options.locallySubmittedSignatures ?? []),
+		pendingTools: new Map(),
 	} as unknown as InteractiveModeContext;
 	return { ctx, editor, setText, addMessageToChat, updatePendingMessagesDisplay };
 }
@@ -118,6 +119,35 @@ describe("EventController message_start (user role)", () => {
 		expect(setText).not.toHaveBeenCalled();
 		expect(ctx.optimisticUserMessageSignature).toBeUndefined();
 	});
+
+	it("appends a queued image submission synchronously so later events cannot reorder it", async () => {
+		// Regression (da636e3f5): AgentSession.#emit dispatches listeners fire-and-forget,
+		// so an await between the user message_start and addMessageToChat lets the next
+		// synchronously-handled events (assistant message_start, tool execution start/end)
+		// append their components first — dropping the user bubble *below* the very tool
+		// output it was sent to steer. The append must happen before the handler settles.
+		const message: UserMessage = {
+			role: "user",
+			content: [
+				{ type: "text", text: "steer mid-stream" },
+				{ type: "image", data: "AAAA", mimeType: "image/png" },
+			],
+			attribution: "user",
+			timestamp: Date.now(),
+		};
+		const signature = "steer mid-stream\u00001";
+		const { ctx, addMessageToChat } = createContext({
+			editorText: "",
+			locallySubmittedSignatures: [signature],
+		});
+		const controller = new EventController(ctx);
+
+		// Fire WITHOUT awaiting: the bubble must already be appended synchronously.
+		const pending = controller.handleEvent({ type: "message_start", message }).catch(() => {});
+		expect(addMessageToChat).toHaveBeenCalledTimes(1);
+		expect(addMessageToChat).toHaveBeenCalledWith(message);
+		await pending;
+	});
 });
 
 function createIrcMessage(timestamp: number): CustomMessage<{ from: string; message: string }> {
@@ -164,11 +194,11 @@ describe("EventController IRC expiry", () => {
 
 		await controller.handleEvent({ type: "irc_message", message });
 
-		expect(chatContainer.children).toHaveLength(2);
+		expect(chatContainer.children).toHaveLength(1);
 		expect(requestRender).toHaveBeenCalledTimes(1);
 
 		vi.advanceTimersByTime(9_999);
-		expect(chatContainer.children).toHaveLength(2);
+		expect(chatContainer.children).toHaveLength(1);
 
 		vi.advanceTimersByTime(1);
 		expect(chatContainer.children).toHaveLength(0);
@@ -185,7 +215,7 @@ describe("EventController IRC expiry", () => {
 		await controller.handleEvent({ type: "irc_message", message });
 
 		expect(addMessageToChat).toHaveBeenCalledTimes(1);
-		expect(chatContainer.children).toHaveLength(2);
+		expect(chatContainer.children).toHaveLength(1);
 		vi.advanceTimersByTime(10_000);
 		expect(chatContainer.children).toHaveLength(0);
 	});
@@ -200,7 +230,7 @@ describe("EventController IRC expiry", () => {
 		controller.dispose();
 		vi.advanceTimersByTime(10_000);
 
-		expect(chatContainer.children).toHaveLength(2);
+		expect(chatContainer.children).toHaveLength(1);
 		expect(requestRender).toHaveBeenCalledTimes(1);
 	});
 });

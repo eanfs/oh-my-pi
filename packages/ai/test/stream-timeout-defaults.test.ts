@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import {
+	getOpenAIStreamFirstEventTimeoutMs,
 	getOpenAIStreamIdleTimeoutMs,
 	getStreamFirstEventTimeoutMs,
 	getStreamIdleTimeoutMs,
 	iterateWithIdleTimeout,
-} from "../src/utils/idle-iterator";
+} from "@oh-my-pi/pi-ai/utils/idle-iterator";
 
 /**
  * Per-provider fallback overrides on the stream-watchdog helpers.
@@ -19,6 +20,7 @@ const ENV_KEYS = [
 	"PI_STREAM_IDLE_TIMEOUT_MS",
 	"PI_OPENAI_STREAM_IDLE_TIMEOUT_MS",
 	"PI_STREAM_FIRST_EVENT_TIMEOUT_MS",
+	"PI_OPENAI_STREAM_FIRST_EVENT_TIMEOUT_MS",
 ] as const;
 
 const originalEnv: Partial<Record<(typeof ENV_KEYS)[number], string | undefined>> = {};
@@ -99,6 +101,34 @@ describe("getStreamFirstEventTimeoutMs(idleTimeoutMs, fallbackMs)", () => {
 
 	it("falls back to the 100s global default when no fallback or env is provided", () => {
 		expect(getStreamFirstEventTimeoutMs()).toBe(100_000);
+	});
+});
+
+describe("getOpenAIStreamFirstEventTimeoutMs(idleTimeoutMs, fallbackMs)", () => {
+	it("floors the first-event budget at the caller-resolved idle when the generic env is lower", () => {
+		Bun.env.PI_STREAM_FIRST_EVENT_TIMEOUT_MS = "20";
+		expect(getOpenAIStreamFirstEventTimeoutMs(1500, 100_000)).toBe(1500);
+	});
+
+	it("honors PI_OPENAI_STREAM_FIRST_EVENT_TIMEOUT_MS even when caller pins per-call idle", () => {
+		Bun.env.PI_OPENAI_STREAM_FIRST_EVENT_TIMEOUT_MS = "42";
+		Bun.env.PI_STREAM_FIRST_EVENT_TIMEOUT_MS = "20";
+		expect(getOpenAIStreamFirstEventTimeoutMs(5_000, 100_000)).toBe(42);
+	});
+
+	it("treats PI_OPENAI_STREAM_FIRST_EVENT_TIMEOUT_MS=0 as an explicit watchdog disable", () => {
+		Bun.env.PI_OPENAI_STREAM_FIRST_EVENT_TIMEOUT_MS = "0";
+		expect(getOpenAIStreamFirstEventTimeoutMs(1500, 100_000)).toBeUndefined();
+	});
+
+	it("falls back to the generic first-event env when OpenAI env vars are unset", () => {
+		Bun.env.PI_STREAM_FIRST_EVENT_TIMEOUT_MS = "42";
+		expect(getOpenAIStreamFirstEventTimeoutMs(undefined, 300_000)).toBe(42);
+	});
+
+	it("respects PI_STREAM_FIRST_EVENT_TIMEOUT_MS=0 disable when no OpenAI override is set", () => {
+		Bun.env.PI_STREAM_FIRST_EVENT_TIMEOUT_MS = "0";
+		expect(getOpenAIStreamFirstEventTimeoutMs(1500, 100_000)).toBeUndefined();
 	});
 });
 
@@ -196,5 +226,34 @@ describe("iterateWithIdleTimeout", () => {
 
 		await Bun.sleep(20);
 		expect(firstItemTimedOut).toBe(false);
+	});
+
+	it("closes the upstream iterator when the consumer breaks early", async () => {
+		let upstreamClosed = false;
+		async function* source(): AsyncGenerator<string> {
+			try {
+				let n = 0;
+				while (true) {
+					await Bun.sleep(1);
+					yield `item-${n++}`;
+				}
+			} finally {
+				// Runs only if the wrapper forwards `.return()` to us.
+				upstreamClosed = true;
+			}
+		}
+
+		for await (const _item of iterateWithIdleTimeout(source(), {
+			idleTimeoutMs: 1_000,
+			errorMessage: "idle timeout",
+		})) {
+			break; // abandon the wrapper after the first item
+		}
+
+		// The wrapper must propagate the consumer's early termination to the source
+		// so the underlying SSE body / SDK stream (and its socket) is released
+		// instead of being left suspended.
+		await Bun.sleep(5);
+		expect(upstreamClosed).toBe(true);
 	});
 });

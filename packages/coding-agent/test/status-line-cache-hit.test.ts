@@ -1,7 +1,8 @@
 import { beforeAll, describe, expect, it } from "bun:test";
-import { renderSegment } from "../src/modes/components/status-line/segments";
-import type { SegmentContext } from "../src/modes/components/status-line/types";
-import { initTheme } from "../src/modes/theme/theme";
+import { stripVTControlCharacters } from "node:util";
+import { renderSegment } from "@oh-my-pi/pi-coding-agent/modes/components/status-line/segments";
+import type { SegmentContext } from "@oh-my-pi/pi-coding-agent/modes/components/status-line/types";
+import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 
 beforeAll(async () => {
 	await initTheme();
@@ -24,7 +25,7 @@ function ctxWith(usage: Partial<SegmentContext["usageStats"]>): SegmentContext {
 
 // ANSI is irrelevant to the rate math; strip it before asserting the number.
 function plain(text: string): string {
-	return text.replace(/\x1b\[[0-9;]*m/g, "");
+	return stripVTControlCharacters(text);
 }
 
 describe("cache_hit status-line segment", () => {

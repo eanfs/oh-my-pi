@@ -10,10 +10,11 @@ import {
 	type WritethroughDeferredHandle,
 	writethroughNoop,
 } from "../lsp";
+import { getDiagnosticsLedger } from "../lsp/diagnostics-ledger";
 import applyPatchDescription from "../prompts/tools/apply-patch.md" with { type: "text" };
 import patchDescription from "../prompts/tools/patch.md" with { type: "text" };
 import replaceDescription from "../prompts/tools/replace.md" with { type: "text" };
-import type { ToolSession } from "../tools";
+import type { DeferredDiagnosticsEntry, ToolSession } from "../tools";
 import { truncateForPrompt } from "../tools/approval";
 import { isInternalUrlPath } from "../tools/path-utils";
 import { type EditMode, normalizeEditMode, resolveEditMode } from "../utils/edit-mode";
@@ -23,6 +24,7 @@ import applyPatchGrammar from "./modes/apply-patch.lark" with { type: "text" };
 import { executePatchSingle, type PatchEditEntry, type PatchParams, patchEditSchema } from "./modes/patch";
 import { executeReplaceSingle, type ReplaceEditEntry, type ReplaceParams, replaceEditSchema } from "./modes/replace";
 import { type EditToolDetails, type EditToolPerFileResult, getLspBatchRequest, type LspBatchRequest } from "./renderer";
+import { EDIT_MODE_STRATEGIES } from "./streaming";
 
 export * from "@oh-my-pi/hashline";
 export { DEFAULT_EDIT_MODE, type EditMode, normalizeEditMode } from "../utils/edit-mode";
@@ -102,7 +104,16 @@ function createEditWritethrough(session: ToolSession): WritethroughCallback {
 	const enableLsp = session.enableLsp ?? true;
 	const enableDiagnostics = enableLsp && session.settings.get("lsp.diagnosticsOnEdit");
 	const enableFormat = enableLsp && session.settings.get("lsp.formatOnWrite");
-	return enableLsp ? createLspWritethrough(session.cwd, { enableFormat, enableDiagnostics }) : writethroughNoop;
+	const dedup = enableDiagnostics && session.settings.get("lsp.diagnosticsDeduplicate");
+	return enableLsp
+		? createLspWritethrough(session.cwd, {
+				enableFormat,
+				enableDiagnostics,
+				transformDiagnostics: dedup
+					? (path, result) => getDiagnosticsLedger(session).reduce(path, result)
+					: undefined,
+			})
+		: writethroughNoop;
 }
 
 /** Run apply_patch file operations and aggregate their multi-file result. */
@@ -264,7 +275,7 @@ function extractApprovalPath(args: unknown): string {
 	const record = args && typeof args === "object" ? (args as Record<string, unknown>) : {};
 	const input = typeof record.input === "string" ? record.input : undefined;
 	if (input) {
-		const hashlineMatch = /^(?:¶|§|@)([^\s#]+)/m.exec(input);
+		const hashlineMatch = /^\[([^#\r\n]+)(?:#[0-9a-fA-F]{4})?\]/m.exec(input);
 		if (hashlineMatch?.[1]) return hashlineMatch[1];
 
 		const applyPatchMatch = /^\*\*\* (?:Add|Update|Delete) File:\s*(.+)$/m.exec(input);
@@ -286,7 +297,6 @@ export class EditTool implements AgentTool<TInput> {
 	readonly name = "edit";
 	readonly label = "Edit";
 	readonly loadMode = "essential";
-	readonly nonAbortable = true;
 	readonly concurrency = "exclusive";
 	readonly strict = true;
 
@@ -294,7 +304,12 @@ export class EditTool implements AgentTool<TInput> {
 	readonly #fuzzyThreshold: number;
 	readonly #writethrough: WritethroughCallback;
 	readonly #editMode?: EditMode;
+	readonly #dedupDiagnostics: boolean;
 	readonly #pendingDeferredFetches = new Map<string, AbortController>();
+	/** Fallback per-path mutation counter used only when the session does not expose
+	 *  a shared one. Prefer `session.bumpFileMutationVersion` so write (and any other
+	 *  tool) mutating the same file also invalidates pending late-diagnostics. */
+	readonly #editVersionByPath = new Map<string, number>();
 
 	constructor(private readonly session: ToolSession) {
 		const {
@@ -306,6 +321,10 @@ export class EditTool implements AgentTool<TInput> {
 		this.#editMode = resolveConfiguredEditMode(envEditVariant);
 		this.#allowFuzzy = resolveAllowFuzzy(session, editFuzzy);
 		this.#fuzzyThreshold = resolveFuzzyThreshold(session, editFuzzyThreshold);
+		this.#dedupDiagnostics =
+			(session.enableLsp ?? true) &&
+			session.settings.get("lsp.diagnosticsOnEdit") &&
+			session.settings.get("lsp.diagnosticsDeduplicate");
 		this.#writethrough = createEditWritethrough(session);
 	}
 
@@ -343,6 +362,15 @@ export class EditTool implements AgentTool<TInput> {
 	get customWireName(): string | undefined {
 		if (this.mode !== "apply_patch") return undefined;
 		return "apply_patch";
+	}
+
+	/**
+	 * Normalize streamed args into the source text this edit introduces, so
+	 * stream matchers (TTSR rules) run against real file content instead of the
+	 * mode-specific patch grammar.
+	 */
+	matcherDigest(args: unknown): string | undefined {
+		return EDIT_MODE_STRATEGIES[this.mode].matcherDigest(args);
 	}
 
 	async execute(
@@ -478,10 +506,11 @@ export class EditTool implements AgentTool<TInput> {
 		}
 
 		const deferredController = new AbortController();
+		const editVersion = this.#bumpFileVersion(path);
 		return {
 			onDeferredDiagnostics: (lateDiagnostics: FileDiagnosticsResult) => {
 				this.#pendingDeferredFetches.delete(path);
-				this.#injectLateDiagnostics(path, lateDiagnostics);
+				this.#injectLateDiagnostics(path, lateDiagnostics, editVersion);
 			},
 			signal: deferredController.signal,
 			finalize: (diagnostics: FileDiagnosticsResult | undefined) => {
@@ -494,19 +523,34 @@ export class EditTool implements AgentTool<TInput> {
 		};
 	}
 
-	#injectLateDiagnostics(path: string, diagnostics: FileDiagnosticsResult): void {
-		const summary = diagnostics.summary ?? "";
-		const lines = diagnostics.messages ?? [];
-		const body = [`Late LSP diagnostics for ${path} (arrived after the edit tool returned):`, summary, ...lines]
-			.filter(Boolean)
-			.join("\n");
+	#injectLateDiagnostics(path: string, diagnostics: FileDiagnosticsResult, editVersion: number): void {
+		const effective = this.#dedupDiagnostics
+			? getDiagnosticsLedger(this.session).reduce(path, diagnostics)
+			: diagnostics;
+		if (this.#dedupDiagnostics && effective.messages.length === 0) return;
 
-		this.session.queueDeferredMessage?.({
-			role: "custom",
-			customType: "lsp-late-diagnostic",
-			content: body,
-			display: false,
-			timestamp: Date.now(),
-		});
+		const entry: DeferredDiagnosticsEntry = {
+			path,
+			summary: effective.summary ?? "",
+			messages: effective.messages ?? [],
+			errored: effective.errored,
+			// Drop at flush time if a later edit to the same file superseded this fetch.
+			isStale: () => this.#fileVersion(path) !== editVersion,
+		};
+		this.session.queueDeferredDiagnostics?.(entry);
+	}
+
+	/** Bump the file's mutation counter (session-global when available). */
+	#bumpFileVersion(path: string): number {
+		if (this.session.bumpFileMutationVersion) return this.session.bumpFileMutationVersion(path);
+		const next = (this.#editVersionByPath.get(path) ?? 0) + 1;
+		this.#editVersionByPath.set(path, next);
+		return next;
+	}
+
+	/** Read the file's current mutation counter (session-global when available). */
+	#fileVersion(path: string): number {
+		if (this.session.getFileMutationVersion) return this.session.getFileMutationVersion(path);
+		return this.#editVersionByPath.get(path) ?? 0;
 	}
 }

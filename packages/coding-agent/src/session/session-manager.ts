@@ -29,6 +29,7 @@ import {
 } from "@oh-my-pi/pi-utils";
 import { ArtifactManager } from "./artifacts";
 import {
+	type BlobPutOptions,
 	type BlobPutResult,
 	BlobStore,
 	externalizeImageData,
@@ -254,6 +255,44 @@ export interface SessionContext {
 	modeData?: Record<string, unknown>;
 }
 
+export const EPHEMERAL_MODEL_CHANGE_ROLE = "fallback";
+
+/** Lists session model strings to try when restoring, in fallback order. */
+export function getRestorableSessionModels(
+	models: Readonly<Record<string, string>>,
+	lastModelChangeRole: string | undefined,
+): string[] {
+	const defaultModel = models.default;
+	if (
+		!lastModelChangeRole ||
+		lastModelChangeRole === "default" ||
+		lastModelChangeRole === EPHEMERAL_MODEL_CHANGE_ROLE
+	) {
+		return defaultModel ? [defaultModel] : [];
+	}
+
+	const roleModel = models[lastModelChangeRole];
+	if (!roleModel) return defaultModel ? [defaultModel] : [];
+	if (!defaultModel || roleModel === defaultModel) return [roleModel];
+	return [roleModel, defaultModel];
+}
+
+/**
+ * Coarse lifecycle status of a session, derived from its last persisted message.
+ *
+ * - `complete` — the last assistant turn ended with no unanswered tool calls, i.e.
+ *   the agent yielded control back to the user.
+ * - `interrupted` — work was cut off mid-flight: a trailing assistant turn with
+ *   pending tool calls, a trailing tool result the agent never continued from, or
+ *   a length-truncated turn.
+ * - `aborted` — the last assistant turn was cancelled by the user.
+ * - `error` — the last assistant turn ended in an error.
+ * - `pending` — a trailing user message with no assistant reply persisted after it.
+ * - `unknown` — status could not be determined (empty/header-only session, or the
+ *   final message was larger than the tail window that was read).
+ */
+export type SessionStatus = "complete" | "interrupted" | "aborted" | "error" | "pending" | "unknown";
+
 export interface SessionInfo {
 	path: string;
 	id: string;
@@ -269,6 +308,11 @@ export interface SessionInfo {
 	size: number;
 	firstMessage: string;
 	allMessagesText: string;
+	/**
+	 * Coarse lifecycle status from the session's last persisted message. Optional:
+	 * synthesized {@link SessionInfo}s (cross-project stubs, tests) leave it unset.
+	 */
+	status?: SessionStatus;
 }
 
 export type ReadonlySessionManager = Pick<
@@ -293,6 +337,7 @@ export type ReadonlySessionManager = Pick<
 	| "getTree"
 	| "getUsageStatistics"
 	| "putBlob"
+	| "putBlobSync"
 >;
 
 function createSessionId(): string {
@@ -708,8 +753,8 @@ export function buildSessionContext(
 	// turn's tool results are off the selected path: its result children live on a
 	// sibling branch, or it is the leaf itself (results are children below it). Left
 	// in place, `transformMessages` fabricates one synthetic "aborted"/"No result
-	// provided" result per dangling call plus a `<turn-aborted>` developer note, which
-	// render as phantom failed calls and re-inject the failed batch into the model's
+	// provided" result per dangling call, which render as phantom failed calls and
+	// re-inject the failed batch into the model's
 	// context — the rewind/restore loop.
 	//
 	// Stripping is necessary but not sufficient: a *modified* assistant turn that still
@@ -800,11 +845,18 @@ function writeTerminalBreadcrumb(cwd: string, sessionFile: string): void {
 	Bun.write(breadcrumbFile, content).catch(() => {});
 }
 
+interface TerminalBreadcrumb {
+	cwd: string;
+	sessionFile: string;
+}
+
 /**
- * Read the terminal breadcrumb for the current terminal, scoped to a cwd.
- * Returns the session file path if it exists and matches the cwd, null otherwise.
+ * Read the raw terminal breadcrumb for the current terminal.
+ * Returns the recorded cwd + session file (verified to exist) regardless of
+ * whether the recorded cwd still matches the current one. Callers decide how
+ * to interpret a cwd mismatch (e.g. a moved/renamed worktree).
  */
-async function readTerminalBreadcrumb(cwd: string): Promise<string | null> {
+async function readTerminalBreadcrumbEntry(): Promise<TerminalBreadcrumb | null> {
 	const terminalId = getTerminalId();
 	if (!terminalId) return null;
 
@@ -817,12 +869,9 @@ async function readTerminalBreadcrumb(cwd: string): Promise<string | null> {
 		const breadcrumbCwd = lines[0];
 		const sessionFile = lines[1];
 
-		// Only return if cwd matches (user might have cd'd)
-		if (path.resolve(breadcrumbCwd) !== path.resolve(cwd)) return null;
-
 		// Verify the session file still exists
 		const stat = fs.statSync(sessionFile, { throwIfNoEntry: false });
-		if (stat?.isFile()) return sessionFile;
+		if (stat?.isFile()) return { cwd: breadcrumbCwd, sessionFile };
 	} catch (err) {
 		if (!isEnoent(err)) logger.debug("Terminal breadcrumb read failed", { err });
 		// Breadcrumb doesn't exist or is corrupt — fall through
@@ -1060,7 +1109,7 @@ async function getSortedSessions(sessionDir: string, storage: SessionStorage): P
 		await Promise.all(
 			files.map(async (path: string) => {
 				try {
-					const content = await storage.readTextPrefix(path, 4096);
+					const [content] = await storage.readTextSlices(path, 4096, 0);
 					const entries = parseJsonlLenient<Record<string, unknown>>(content);
 					if (entries.length === 0) return;
 					const header = entries[0] as Record<string, unknown>;
@@ -1176,7 +1225,7 @@ async function truncateForPersistence(obj: unknown, blobStore: BlobStore, key?: 
 				if (key === TEXT_CONTENT_KEY && isImageBlock(item)) {
 					if (!isBlobRef(item.data) && item.data.length >= BLOB_EXTERNALIZE_THRESHOLD) {
 						changed = true;
-						const blobRef = await externalizeImageData(blobStore, item.data);
+						const blobRef = await externalizeImageData(blobStore, item.data, item.mimeType);
 						return { ...item, data: blobRef };
 					}
 				}
@@ -1270,13 +1319,15 @@ function truncateForPersistenceSync(obj: unknown, blobStore: BlobStore, key?: st
 		const result: unknown[] = new Array(obj.length);
 		for (let i = 0; i < obj.length; i++) {
 			const item = obj[i];
-			if (key === TEXT_CONTENT_KEY && isImageBlock(item)) {
-				if (!isBlobRef(item.data) && item.data.length >= BLOB_EXTERNALIZE_THRESHOLD) {
-					changed = true;
-					const blobRef = externalizeImageDataSync(blobStore, item.data);
-					result[i] = { ...item, data: blobRef };
-					continue;
-				}
+			if (
+				key === TEXT_CONTENT_KEY &&
+				isImageBlock(item) &&
+				!isBlobRef(item.data) &&
+				item.data.length >= BLOB_EXTERNALIZE_THRESHOLD
+			) {
+				changed = true;
+				result[i] = { ...item, data: externalizeImageDataSync(blobStore, item.data, item.mimeType) };
+				continue;
 			}
 			const newItem = truncateForPersistenceSync(item, blobStore, key);
 			if (newItem !== item) changed = true;
@@ -1512,21 +1563,79 @@ function extractTextFromContent(content: Message["content"]): string {
 }
 
 const SESSION_LIST_PREFIX_BYTES = 4096;
+/**
+ * Tail window read to derive {@link SessionStatus}. Large enough to capture a
+ * typical final assistant turn (thinking + text); when the final message exceeds
+ * it the status falls back to `unknown` rather than misreporting.
+ */
+const SESSION_LIST_SUFFIX_BYTES = 32_768;
 const SESSION_LIST_PARALLEL_THRESHOLD = 64;
 const SESSION_LIST_MAX_WORKERS = 16;
-const sessionListPrefixDecoder = new TextDecoder("utf-8", { fatal: false });
 
-async function readSessionListPrefix(file: string, storage: SessionStorage, buffer: Buffer): Promise<string> {
-	if (!(storage instanceof FileSessionStorage)) {
-		return storage.readTextPrefix(file, buffer.byteLength);
+/**
+ * Derive a {@link SessionStatus} from a tail window of a session file. Entries are
+ * newline-terminated on write, so within the window only the first line can be a
+ * partial fragment — it simply fails to parse and is skipped. We walk backwards to
+ * the last `message` entry and classify by its role / stop reason.
+ */
+function deriveSessionStatus(suffix: string): SessionStatus {
+	if (!suffix) return "unknown";
+	const lines = suffix.split("\n");
+	for (let i = lines.length - 1; i >= 0; i--) {
+		const line = lines[i];
+		// Every persisted entry is `JSON.stringify(obj)` → starts with `{`. This
+		// cheaply rejects blank lines and the leading partial fragment without
+		// attempting to parse a multi-KB tail of a truncated line.
+		if (line.charCodeAt(0) !== 123) continue;
+		let entry: { type?: string; message?: TailMessage };
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (entry.type === "message" && entry.message) {
+			return statusFromTailMessage(entry.message);
+		}
 	}
+	return "unknown";
+}
 
-	const handle = await fs.promises.open(file, "r");
-	try {
-		const { bytesRead } = await handle.read(buffer, 0, buffer.byteLength, 0);
-		return sessionListPrefixDecoder.decode(buffer.subarray(0, bytesRead));
-	} finally {
-		await handle.close();
+interface TailMessage {
+	role?: string;
+	stopReason?: string;
+	content?: unknown;
+}
+
+function isToolCallBlock(block: unknown): boolean {
+	return typeof block === "object" && block !== null && (block as { type?: unknown }).type === "toolCall";
+}
+
+function statusFromTailMessage(message: TailMessage): SessionStatus {
+	switch (message.role) {
+		case "assistant": {
+			switch (message.stopReason) {
+				case "error":
+					return "error";
+				case "aborted":
+					return "aborted";
+				case "length":
+					return "interrupted";
+			}
+			// A turn that ends without unanswered tool calls means the agent yielded
+			// control back to the user — complete. Trailing tool calls (no tool
+			// results after) mean the loop was cut off before running them.
+			const content = message.content;
+			if (Array.isArray(content) && content.some(isToolCallBlock)) return "interrupted";
+			return "complete";
+		}
+		case "toolResult":
+			// Tools ran but the agent never produced the following assistant turn.
+			return "interrupted";
+		case "user":
+			// User message with no assistant reply persisted after it.
+			return "pending";
+		default:
+			return "unknown";
 	}
 }
 
@@ -1661,13 +1770,15 @@ function getSessionListWorkerCount(fileCount: number): number {
 	);
 }
 
-async function collectSessionFromFile(
-	file: string,
-	storage: SessionStorage,
-	buffer: Buffer,
-): Promise<SessionInfo | undefined> {
+async function collectSessionFromFile(file: string, storage: SessionStorage): Promise<SessionInfo | undefined> {
 	try {
-		const content = await readSessionListPrefix(file, storage, buffer);
+		const stat = storage.statSync(file);
+		const [content, suffix] = await storage.readTextSlices(
+			file,
+			SESSION_LIST_PREFIX_BYTES,
+			SESSION_LIST_SUFFIX_BYTES,
+		);
+		const { size, mtime } = stat;
 		const entries = parseJsonlLenient<Record<string, unknown>>(content);
 		const header = parseSessionListHeader(content, entries);
 		if (!header) return undefined;
@@ -1703,7 +1814,6 @@ async function collectSessionFromFile(
 
 		firstMessage ||= extractFirstUserMessageFromPrefix(content) ?? "";
 		const messageCount = Math.max(parsedMessageCount, countMessageMarkers(content));
-		const stats = storage.statSync(file);
 		return {
 			path: file,
 			id: header.id,
@@ -1711,11 +1821,12 @@ async function collectSessionFromFile(
 			title: header.title ?? shortSummary,
 			parentSessionPath: header.parentSession,
 			created: new Date(header.timestamp ?? ""),
-			modified: stats.mtime,
+			modified: mtime,
 			messageCount,
-			size: stats.size,
+			size,
 			firstMessage: firstMessage || "(no messages)",
 			allMessagesText: allMessages.length > 0 ? allMessages.join(" ") : firstMessage,
+			status: deriveSessionStatus(suffix),
 		};
 	} catch {
 		return undefined;
@@ -1729,10 +1840,9 @@ async function collectSessionsFromFileStride(
 	stride: number,
 ): Promise<SessionInfo[]> {
 	const sessions: SessionInfo[] = [];
-	const buffer = Buffer.allocUnsafe(SESSION_LIST_PREFIX_BYTES);
 
 	for (let i = startIndex; i < files.length; i += stride) {
-		const session = await collectSessionFromFile(files[i], storage, buffer);
+		const session = await collectSessionFromFile(files[i], storage);
 		if (session) sessions.push(session);
 	}
 
@@ -1808,6 +1918,8 @@ export async function resolveResumableSession(
 	return { session: globalMatch, scope: "global" };
 }
 interface SessionManagerStateSnapshot {
+	cwd: string;
+	sessionDir: string;
 	sessionId: string;
 	sessionName: string | undefined;
 	titleSource: "auto" | "user" | undefined;
@@ -1837,6 +1949,12 @@ export class SessionManager {
 		premiumRequests: 0,
 		cost: 0,
 	} satisfies UsageStatistics;
+	/** Per-turn output-token budget set by a `+Nk` directive (total null when none this turn). */
+	#turnBudget: { total: number | null; hard: boolean } = { total: null, hard: false };
+	/** Cumulative `output` snapshot captured when the current turn budget window opened. */
+	#turnBaselineOutput = 0;
+	/** Output tokens consumed by eval-spawned subagents in the current turn window. */
+	#turnEvalOutput = 0;
 	#persistWriter: NdjsonFileWriter | undefined;
 	#persistWriterPath: string | undefined;
 	#persistChain: Promise<void> = Promise.resolve();
@@ -1853,6 +1971,8 @@ export class SessionManager {
 	#inMemoryArtifacts: Map<string, string> | null = null;
 	#inMemoryArtifactCounter = 0;
 	readonly #blobStore: BlobStore;
+	#suppressBreadcrumb = false;
+	#sessionNameChangedCallbacks = new Set<() => void>();
 
 	private constructor(
 		private cwd: string,
@@ -1867,13 +1987,25 @@ export class SessionManager {
 		// Note: call _initSession() or _initSessionFile() after construction
 	}
 
+	#maybeWriteBreadcrumb(cwd: string, sessionFile: string): void {
+		if (this.#suppressBreadcrumb) return;
+		writeTerminalBreadcrumb(cwd, sessionFile);
+	}
+
 	/** Puts a binary blob into the blob store and returns the blob reference */
-	async putBlob(data: Buffer): Promise<BlobPutResult> {
-		return this.#blobStore.put(data);
+	async putBlob(data: Buffer, options?: BlobPutOptions): Promise<BlobPutResult> {
+		return this.#blobStore.put(data, options);
+	}
+
+	/** Synchronous variant of {@link putBlob} for rebuild-only render paths. */
+	putBlobSync(data: Buffer, options?: BlobPutOptions): BlobPutResult {
+		return this.#blobStore.putSync(data, options);
 	}
 
 	captureState(): SessionManagerStateSnapshot {
 		return {
+			cwd: this.cwd,
+			sessionDir: this.sessionDir,
 			sessionId: this.#sessionId,
 			sessionName: this.#sessionName,
 			titleSource: this.#titleSource,
@@ -1887,6 +2019,8 @@ export class SessionManager {
 	}
 
 	restoreState(snapshot: SessionManagerStateSnapshot): void {
+		this.cwd = snapshot.cwd;
+		this.sessionDir = snapshot.sessionDir;
 		this.#sessionId = snapshot.sessionId;
 		this.#sessionName = snapshot.sessionName;
 		this.#titleSource = snapshot.titleSource;
@@ -1904,7 +2038,7 @@ export class SessionManager {
 		this.#adoptedArtifactManager = null;
 		this.#buildIndex();
 		if (this.#sessionFile) {
-			writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+			this.#maybeWriteBreadcrumb(this.cwd, this.#sessionFile);
 		}
 	}
 
@@ -1924,13 +2058,25 @@ export class SessionManager {
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;
 		this.#sessionFile = path.resolve(sessionFile);
-		writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+		this.#maybeWriteBreadcrumb(this.cwd, this.#sessionFile);
 		this.#fileEntries = await loadEntriesFromFile(this.#sessionFile, this.storage);
 		if (this.#fileEntries.length > 0) {
 			const header = this.#fileEntries.find(e => e.type === "session") as SessionHeader | undefined;
 			this.#sessionId = header?.id ?? createSessionId();
 			this.#sessionName = header?.title;
 			this.#titleSource = header?.titleSource;
+
+			// Adopt the loaded session's own working directory. Sessions are stored in
+			// a directory keyed by their cwd, so resuming a session from another
+			// project (e.g. global review in the picker) must re-point cwd/sessionDir
+			// at that project. Same-cwd resumes and in-place reloads are a no-op; old
+			// sessions with no recorded cwd keep the current cwd.
+			const headerCwd = header?.cwd ? path.resolve(header.cwd) : undefined;
+			if (headerCwd && headerCwd !== this.cwd) {
+				this.cwd = headerCwd;
+				this.sessionDir = path.resolve(this.#sessionFile, "..");
+				this.#maybeWriteBreadcrumb(this.cwd, this.#sessionFile);
+			}
 
 			this.#needsFullRewriteOnNextPersist = migrateToCurrentVersion(this.#fileEntries);
 
@@ -2022,19 +2168,24 @@ export class SessionManager {
 	/**
 	 * Move the session to a new working directory.
 	 * Moves session files and artifacts on disk, updates all internal references,
-	 * and rewrites the session header with the new cwd.
+	 * and rewrites the session header with the new cwd. When provided,
+	 * `targetSessionDir` is used instead of deriving the default directory for
+	 * the new cwd (for `--continue --session-dir` / `--resume --session-dir`).
 	 */
-	async moveTo(newCwd: string): Promise<void> {
+	async moveTo(newCwd: string, targetSessionDir?: string): Promise<void> {
 		const resolvedCwd = path.resolve(newCwd);
-		if (resolvedCwd === this.cwd) return;
+		if (resolvedCwd === this.cwd && (!targetSessionDir || path.resolve(targetSessionDir) === this.sessionDir)) return;
 
 		const managedSessionsRoot = resolveManagedSessionRoot(this.sessionDir, this.cwd);
-		const newSessionDir = managedSessionsRoot
-			? computeDefaultSessionDir(resolvedCwd, this.storage, managedSessionsRoot)
-			: computeDefaultSessionDir(resolvedCwd, this.storage);
+		const newSessionDir = targetSessionDir
+			? path.resolve(targetSessionDir)
+			: managedSessionsRoot
+				? computeDefaultSessionDir(resolvedCwd, this.storage, managedSessionsRoot)
+				: computeDefaultSessionDir(resolvedCwd, this.storage);
 		let hadSessionFile = false;
 
 		if (this.persist && this.#sessionFile) {
+			this.storage.ensureDirSync(newSessionDir);
 			// Close the persist writer before moving files
 			await this.#closePersistWriter();
 			this.#persistChain = Promise.resolve();
@@ -2045,25 +2196,29 @@ export class SessionManager {
 			const newSessionFile = path.join(newSessionDir, path.basename(oldSessionFile));
 			const oldArtifactDir = oldSessionFile.slice(0, -6); // strip .jsonl
 			const newArtifactDir = newSessionFile.slice(0, -6);
+			const sameSessionFile = path.resolve(oldSessionFile) === path.resolve(newSessionFile);
+			const sameArtifactDir = path.resolve(oldArtifactDir) === path.resolve(newArtifactDir);
 			hadSessionFile = this.storage.existsSync(oldSessionFile);
 			let movedSessionFile = false;
 			let movedArtifactDir = false;
 
 			try {
 				// Guard: session file may not exist yet (no assistant messages persisted)
-				if (hadSessionFile) {
+				if (hadSessionFile && !sameSessionFile) {
 					await fs.promises.rename(oldSessionFile, newSessionFile);
 					movedSessionFile = true;
 				}
 
-				try {
-					const stat = await fs.promises.stat(oldArtifactDir);
-					if (stat.isDirectory()) {
-						await fs.promises.rename(oldArtifactDir, newArtifactDir);
-						movedArtifactDir = true;
+				if (!sameArtifactDir) {
+					try {
+						const stat = await fs.promises.stat(oldArtifactDir);
+						if (stat.isDirectory()) {
+							await fs.promises.rename(oldArtifactDir, newArtifactDir);
+							movedArtifactDir = true;
+						}
+					} catch (err) {
+						if (!isEnoent(err)) throw err;
 					}
-				} catch (err) {
-					if (!isEnoent(err)) throw err;
 				}
 			} catch (err) {
 				if (movedArtifactDir) {
@@ -2110,7 +2265,7 @@ export class SessionManager {
 
 		// Update terminal breadcrumb
 		if (this.#sessionFile) {
-			writeTerminalBreadcrumb(resolvedCwd, this.#sessionFile);
+			this.#maybeWriteBreadcrumb(resolvedCwd, this.#sessionFile);
 		}
 	}
 
@@ -2145,7 +2300,7 @@ export class SessionManager {
 		if (this.persist) {
 			const fileTimestamp = timestamp.replace(/[:.]/g, "-");
 			this.#sessionFile = path.join(this.getSessionDir(), `${fileTimestamp}_${this.#sessionId}.jsonl`);
-			writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+			this.#maybeWriteBreadcrumb(this.cwd, this.#sessionFile);
 		}
 		return this.#sessionFile;
 	}
@@ -2397,6 +2552,32 @@ export class SessionManager {
 		return this.#usageStatistics;
 	}
 
+	/**
+	 * Open a new per-turn budget window: snapshot the cumulative output baseline,
+	 * reset the eval-subagent counter, and set the (optional) ceiling. Called once
+	 * per real user message; `total` is null when no `+Nk` directive was present.
+	 */
+	beginTurnBudget(total: number | null, hard: boolean): void {
+		this.#turnBudget = { total, hard };
+		this.#turnBaselineOutput = this.#usageStatistics.output;
+		this.#turnEvalOutput = 0;
+	}
+
+	/** Record output tokens consumed by an eval-spawned subagent in the current turn. */
+	recordEvalSubagentOutput(output: number): void {
+		if (Number.isFinite(output) && output > 0) this.#turnEvalOutput += output;
+	}
+
+	/**
+	 * Current turn budget for the eval `budget` helper: the ceiling (null = none),
+	 * output tokens spent this turn (main loop + eval-spawned subagents, no
+	 * double-count), and whether the ceiling is hard.
+	 */
+	getTurnBudget(): { total: number | null; spent: number; hard: boolean } {
+		const mainDelta = Math.max(0, this.#usageStatistics.output - this.#turnBaselineOutput);
+		return { total: this.#turnBudget.total, spent: mainDelta + this.#turnEvalOutput, hard: this.#turnBudget.hard };
+	}
+
 	getSessionDir(): string {
 		return this.sessionDir;
 	}
@@ -2563,6 +2744,23 @@ export class SessionManager {
 		return this.#sessionName;
 	}
 
+	onSessionNameChanged(cb: () => void): () => void {
+		this.#sessionNameChangedCallbacks.add(cb);
+		return () => {
+			this.#sessionNameChangedCallbacks.delete(cb);
+		};
+	}
+
+	#fireSessionNameChanged(): void {
+		for (const cb of [...this.#sessionNameChangedCallbacks]) {
+			try {
+				cb();
+			} catch (err) {
+				logger.warn("SessionManager: session name change hook failed", { error: String(err) });
+			}
+		}
+	}
+
 	/** Strip C0/C1 control characters (includes ESC, so removes ANSI sequences) and collapse whitespace. */
 	static #sanitizeName(name: string): string {
 		return name
@@ -2598,6 +2796,7 @@ export class SessionManager {
 		if (this.persist && sessionFile && this.storage.existsSync(sessionFile)) {
 			await this.#rewriteFile();
 		}
+		this.#fireSessionNameChanged();
 		return true;
 	}
 
@@ -3268,9 +3467,11 @@ export class SessionManager {
 		cwd: string,
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
+		options?: { suppressBreadcrumb?: boolean },
 	): Promise<SessionManager> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const manager = new SessionManager(cwd, dir, true, storage);
+		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
 		const forkEntries = structuredClone(await loadEntriesFromFile(sourcePath, storage)) as FileEntry[];
 		migrateToCurrentVersion(forkEntries);
 		await resolveBlobRefsInEntries(forkEntries, manager.#blobStore);
@@ -3322,8 +3523,49 @@ export class SessionManager {
 	): Promise<SessionManager> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		// Prefer terminal-scoped breadcrumb (handles concurrent sessions correctly)
-		const terminalSession = await readTerminalBreadcrumb(cwd);
-		const mostRecent = terminalSession ?? (await findMostRecentSession(dir, storage));
+		const breadcrumb = await readTerminalBreadcrumbEntry();
+		const breadcrumbCwd = breadcrumb ? path.resolve(breadcrumb.cwd) : undefined;
+		const resolvedCwd = path.resolve(cwd);
+		let mostRecent: string | null | undefined;
+		if (breadcrumb && breadcrumbCwd !== resolvedCwd) {
+			// The terminal's last session was started in a different cwd. If that cwd no
+			// longer exists (e.g. `git worktree move`/dir rename) and the new location has
+			// no sessions of its own, re-root the session here instead of silently starting
+			// fresh — otherwise the relocated session would be unreachable via --continue.
+			// When an explicit sessionDir is reused across the move, the stale breadcrumb
+			// file itself may be the most recent entry there; don't count it as a
+			// current-directory session. If that shared dir also contains an older session
+			// that already belongs to the current cwd, prefer that local session instead
+			// of re-rooting the stale breadcrumb over it.
+			const resolvedBreadcrumbCwd = path.resolve(breadcrumb.cwd);
+			mostRecent = await findMostRecentSession(dir, storage);
+			const sourceCwdGone = !fs.existsSync(resolvedBreadcrumbCwd);
+			const breadcrumbSessionFile = path.resolve(breadcrumb.sessionFile);
+			const mostRecentIsBreadcrumb =
+				mostRecent !== null && mostRecent !== undefined && path.resolve(mostRecent) === breadcrumbSessionFile;
+			let hasCurrentCwdSession = false;
+			if (sourceCwdGone && mostRecentIsBreadcrumb) {
+				const currentCwdSession = (await SessionManager.list(cwd, dir, storage)).find(
+					session =>
+						path.resolve(session.path) !== breadcrumbSessionFile &&
+						session.cwd &&
+						path.resolve(session.cwd) === resolvedCwd,
+				);
+				if (currentCwdSession) {
+					mostRecent = currentCwdSession.path;
+					hasCurrentCwdSession = true;
+				}
+			}
+			const relocated = sourceCwdGone && (mostRecent === null || (mostRecentIsBreadcrumb && !hasCurrentCwdSession));
+			if (relocated) {
+				logger.info("Re-rooting moved session", { from: resolvedBreadcrumbCwd, to: resolvedCwd });
+				const manager = await SessionManager.open(breadcrumb.sessionFile, undefined, storage);
+				await manager.moveTo(cwd, sessionDir);
+				return manager;
+			}
+		}
+		const terminalSession = breadcrumb && breadcrumbCwd === resolvedCwd ? breadcrumb.sessionFile : null;
+		if (mostRecent === undefined) mostRecent = terminalSession ?? (await findMostRecentSession(dir, storage));
 		const manager = new SessionManager(cwd, dir, true, storage);
 		if (mostRecent) {
 			await manager.#initSessionFile(mostRecent);

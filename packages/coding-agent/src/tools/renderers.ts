@@ -17,7 +17,7 @@ import { astGrepToolRenderer } from "./ast-grep";
 import { bashToolRenderer } from "./bash";
 import { browserToolRenderer } from "./browser/render";
 import { debugToolRenderer } from "./debug";
-import { evalToolRenderer } from "./eval";
+import { evalToolRenderer } from "./eval-render";
 import { findToolRenderer } from "./find";
 import { githubToolRenderer } from "./gh-renderer";
 import { inspectImageToolRenderer } from "./inspect-image-renderer";
@@ -28,10 +28,10 @@ import { resolveToolRenderer } from "./resolve";
 import { searchToolRenderer } from "./search";
 import { searchToolBm25Renderer } from "./search-tool-bm25";
 import { sshToolRenderer } from "./ssh";
-import { todoWriteToolRenderer } from "./todo-write";
+import { todoToolRenderer } from "./todo";
 import { writeToolRenderer } from "./write";
 
-type ToolRenderer = {
+export type ToolRenderer = {
 	renderCall: (args: unknown, options: RenderResultOptions, theme: Theme) => Component;
 	renderResult: (
 		result: { content: Array<{ type: string; text?: string }>; details?: unknown; isError?: boolean },
@@ -67,7 +67,7 @@ export const toolRenderers: Record<string, ToolRenderer> = {
 	search_tool_bm25: searchToolBm25Renderer as ToolRenderer,
 	ssh: sshToolRenderer as ToolRenderer,
 	task: taskToolRenderer as ToolRenderer,
-	todo_write: todoWriteToolRenderer as ToolRenderer,
+	todo: todoToolRenderer as ToolRenderer,
 	github: githubToolRenderer as ToolRenderer,
 	goal: goalToolRenderer as ToolRenderer,
 	web_search: webSearchToolRenderer as ToolRenderer,

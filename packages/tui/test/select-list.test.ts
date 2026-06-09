@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { SelectList } from "@oh-my-pi/pi-tui/components/select-list";
+import { KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "@oh-my-pi/pi-tui/keybindings";
 import { visibleWidth } from "@oh-my-pi/pi-tui/utils";
-import { SelectList } from "../src/components/select-list";
-import { KeybindingsManager, setKeybindings, TUI_KEYBINDINGS } from "../src/keybindings";
 
 const testTheme = {
 	selectedPrefix: (text: string) => text,
@@ -167,5 +167,62 @@ describe("SelectList", () => {
 		list.handleInput("\n");
 
 		expect(selectedValue).toBe("run");
+	});
+
+	it("fuzzy-filters overflowing lists from typed input", () => {
+		const items = [
+			{ value: "ollama", label: "Ollama" },
+			{ value: "kagi", label: "Kagi" },
+			{ value: "opencode-go", label: "OpenCode Go" },
+			{ value: "tavily", label: "Tavily" },
+		];
+		const list = new SelectList(items, 3, testTheme);
+
+		list.handleInput("o");
+		list.handleInput("g");
+
+		const rendered = list.render(80).join("\n");
+		expect(rendered).toContain("OpenCode Go");
+		expect(rendered).not.toContain("Ollama");
+		expect(rendered).toContain("Search: og");
+		expect(list.getSelectedItem()?.value).toBe("opencode-go");
+	});
+
+	it("keeps printable keys inert when the list does not overflow", () => {
+		const items = [
+			{ value: "alpha", label: "Alpha" },
+			{ value: "beta", label: "Beta" },
+		];
+		const list = new SelectList(items, 2, testTheme);
+
+		list.handleInput("b");
+
+		const rendered = list.render(80).join("\n");
+		expect(rendered).toContain("Alpha");
+		expect(rendered).toContain("Beta");
+		expect(rendered).not.toContain("Search:");
+		expect(list.getSelectedItem()?.value).toBe("alpha");
+	});
+
+	it("renders a right-edge scrollbar when the list overflows maxVisible", () => {
+		const items = Array.from({ length: 8 }, (_, i) => ({ value: `v${i}`, label: `Item ${i}` }));
+		const list = new SelectList(items, 3, testTheme);
+
+		const rendered = list.render(40);
+
+		// Default ScrollView glyphs: track │, thumb █. Overflow must surface the bar
+		// and drop the old (N/M) text indicator.
+		expect(rendered.join("\n")).toContain("█");
+		expect(rendered.join("\n")).not.toContain("(1/8)");
+	});
+
+	it("omits the scrollbar when every item fits", () => {
+		const items = [
+			{ value: "alpha", label: "Alpha" },
+			{ value: "beta", label: "Beta" },
+		];
+		const list = new SelectList(items, 5, testTheme);
+
+		expect(list.render(40).join("\n")).not.toContain("█");
 	});
 });

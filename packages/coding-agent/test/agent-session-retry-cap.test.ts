@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import { type AssistantMessage, getBundledModel } from "@oh-my-pi/pi-ai";
+import { type ApiKeyResolveContext, type AssistantMessage, getBundledModel } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -20,6 +20,16 @@ function lastAssistant(session: AgentSession): AssistantMessage {
 		throw new Error("Expected trailing assistant message");
 	}
 	return message as AssistantMessage;
+}
+
+function resolveInitialApiKey(
+	apiKey: string | ((ctx: ApiKeyResolveContext) => string | Promise<string | undefined> | undefined) | undefined,
+): string {
+	const resolved = typeof apiKey === "function" ? apiKey({ lastChance: false, error: undefined }) : apiKey;
+	if (typeof resolved !== "string") {
+		throw new Error("Expected API key to be resolved before streaming");
+	}
+	return resolved;
 }
 
 /**
@@ -127,6 +137,83 @@ describe("AgentSession retry delay cap", () => {
 		expect(last.stopReason).toBe("error");
 		expect(last.errorMessage).toContain("rate_limit_error");
 		expect(session.isRetrying).toBe(false);
+	});
+
+	it("switches credentials instead of failing the delay cap for account rate limits", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) {
+			throw new Error("Expected bundled Anthropic test model to exist");
+		}
+
+		authStorage.removeRuntimeApiKey("anthropic");
+		await authStorage.set("anthropic", [
+			{ type: "api_key", key: "anthropic-key-1" },
+			{ type: "api_key", key: "anthropic-key-2" },
+		]);
+
+		const rateLimitError =
+			'429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account\'s rate limit. Please try again later."}} retry-after-ms=11180000';
+		const mock = createMockModel();
+		const requestedKeys: string[] = [];
+		let agent!: Agent;
+		agent = new Agent({
+			getApiKey: provider => modelRegistry.getApiKeyForProvider(provider, agent.sessionId),
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: (requestedModel, context, options) => {
+				const apiKey = resolveInitialApiKey(options?.apiKey);
+				requestedKeys.push(apiKey);
+				if (requestedKeys.length === 1) {
+					mock.push({ throw: rateLimitError });
+				} else {
+					mock.push({ content: ["recovered after credential switch"] });
+				}
+				return mock.stream(requestedModel, context, options);
+			},
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxDelayMs": 100,
+			"retry.maxRetries": 1,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const retryStartEvents: AutoRetryStartEvent[] = [];
+		const retryEndEvents: AutoRetryEndEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") retryStartEvents.push(event);
+			if (event.type === "auto_retry_end") retryEndEvents.push(event);
+		});
+
+		await session.prompt("Trigger account rate limit with long retry-after");
+		await session.waitForIdle();
+
+		expect(requestedKeys).toHaveLength(2);
+		expect(new Set(requestedKeys).size).toBe(2);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryStartEvents[0]).toMatchObject({ delayMs: 0 });
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({ success: true, attempt: 1 });
+		for (const call of waitSpy.mock.calls) {
+			expect(call[0]).toBeLessThanOrEqual(100);
+		}
+		const last = lastAssistant(session);
+		expect(last.stopReason).toBe("stop");
+		expect(last.content).toContainEqual({ type: "text", text: "recovered after credential switch" });
 	});
 
 	it("still retries normally when the delay is under retry.maxDelayMs", async () => {
@@ -248,5 +335,61 @@ describe("AgentSession retry delay cap", () => {
 		expect(retryEndEvents[0]).toMatchObject({ success: true });
 		const last = lastAssistant(session);
 		expect(last.stopReason).toBe("stop");
+	});
+	it("retries generic upstream_error gateway failures", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) {
+			throw new Error("Expected bundled Anthropic test model to exist");
+		}
+
+		const mock = createMockModel({
+			responses: [
+				{ throw: "upstream_error: Upstream request failed" },
+				{ content: ["recovered after generic gateway upstream error"] },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: mock.stream,
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxDelayMs": 5_000,
+			"retry.maxRetries": 1,
+		});
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const retryStartEvents: AutoRetryStartEvent[] = [];
+		const retryEndEvents: AutoRetryEndEvent[] = [];
+		session.subscribe(event => {
+			if (event.type === "auto_retry_start") retryStartEvents.push(event);
+			if (event.type === "auto_retry_end") retryEndEvents.push(event);
+		});
+
+		await session.prompt("Trigger generic upstream_error");
+		await session.waitForIdle();
+
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryEndEvents).toHaveLength(1);
+		expect(retryEndEvents[0]).toMatchObject({ success: true, attempt: 1 });
+		const last = lastAssistant(session);
+		expect(last.stopReason).toBe("stop");
+		expect(last.content).toContainEqual({ type: "text", text: "recovered after generic gateway upstream error" });
 	});
 });

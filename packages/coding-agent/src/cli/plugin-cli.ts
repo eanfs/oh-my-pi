@@ -348,10 +348,13 @@ async function handleInstall(
 	flags: { json?: boolean; force?: boolean; dryRun?: boolean; scope?: "user" | "project" },
 ): Promise<void> {
 	if (packages.length === 0) {
-		console.error(chalk.red(`Usage: ${APP_NAME} plugin install <package[@version]>[features] ...`));
+		console.error(chalk.red(`Usage: ${APP_NAME} plugin install <source>[features] ...`));
 		console.error(chalk.dim("Examples:"));
 		console.error(chalk.dim(`  ${APP_NAME} plugin install @oh-my-pi/exa`));
 		console.error(chalk.dim(`  ${APP_NAME} plugin install name@marketplace`));
+		console.error(chalk.dim(`  ${APP_NAME} plugin install github:user/repo`));
+		console.error(chalk.dim(`  ${APP_NAME} plugin install https://github.com/user/repo#v1.0`));
+		console.error(chalk.dim(`  ${APP_NAME} plugin install ./path/to/local/plugin`));
 		process.exit(1);
 	}
 
@@ -373,6 +376,49 @@ async function handleInstall(
 						`${theme.status.success} Installed ${target.name} from ${target.marketplace} (${entry.version})`,
 					),
 				);
+			} catch (err) {
+				console.error(chalk.red(`${theme.status.error} Failed to install ${spec}: ${err}`));
+				process.exit(1);
+			}
+			continue;
+		}
+
+		if (target.type === "local") {
+			// Local paths route to link(): symlink the directory into the plugins
+			// node_modules tree so source edits show up without a reinstall. Matches
+			// `omp plugin link <path>` so users can use either verb interchangeably.
+			if (flags.scope) {
+				console.error(
+					chalk.yellow(
+						`Warning: --scope is only supported for marketplace installs (name@marketplace). Ignoring for ${spec}.`,
+					),
+				);
+			}
+			if (flags.force) {
+				console.error(
+					chalk.yellow(
+						`Warning: --force has no effect for local path installs (link is already idempotent). Ignoring for ${spec}.`,
+					),
+				);
+			}
+			if (flags.dryRun) {
+				if (flags.json) {
+					console.log(JSON.stringify({ dryRun: true, action: "link", path: target.path }, null, 2));
+				} else {
+					console.log(chalk.dim(`[dry-run] Would link ${spec}`));
+				}
+				continue;
+			}
+			try {
+				const result = await manager.link(target.path);
+				if (flags.json) {
+					console.log(JSON.stringify(result, null, 2));
+				} else {
+					console.log(chalk.green(`${theme.status.success} Linked ${result.name} from ${spec}`));
+					if (result.manifest.description) {
+						console.log(chalk.dim(`  ${result.manifest.description}`));
+					}
+				}
 			} catch (err) {
 				console.error(chalk.red(`${theme.status.error} Failed to install ${spec}: ${err}`));
 				process.exit(1);
@@ -898,7 +944,7 @@ export function printPluginHelp(): void {
 	console.log(`${chalk.bold(`${APP_NAME} plugin`)} - Plugin lifecycle management
 
 ${chalk.bold("Commands:")}
-  install <pkg[@ver]>[features]  Install plugins from npm
+  install <source>[features]     Install plugins from npm, GitHub, or git URL
   uninstall <pkg>                Remove plugins
   list                           Show installed plugins
   link <path>                    Link local plugin for development
@@ -915,6 +961,13 @@ ${chalk.bold("Feature Syntax:")}
   pkg[feat1,feat2]   Install with specific features
   pkg[*]             Install with all features
   pkg[]              Install with no optional features
+
+${chalk.bold("Sources:")}
+  pkg, pkg@1.2.3                  npm package (optionally pinned)
+  github:user/repo[#ref]          GitHub shorthand (also gitlab:, bitbucket:, codeberg:, sourcehut:)
+  https://github.com/user/repo    Full git URL (https, ssh, or git protocol)
+  name@marketplace                Marketplace plugin (see marketplace command)
+  ./path, ../path, /abs, ~/path   Local plugin directory (symlinked, same as plugin link)
 
 ${chalk.bold("Config Subcommands:")}
   config list <pkg>              List all settings
@@ -938,5 +991,6 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} plugin config set my-plugin apiKey sk-xxx
   ${APP_NAME} plugin doctor --fix
   ${APP_NAME} plugin install --scope project name@marketplace
+  ${APP_NAME} plugin install github:user/repo#v1.0
 `);
 }

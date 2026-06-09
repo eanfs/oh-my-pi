@@ -9,6 +9,7 @@
 - Model-facing prompt: `packages/coding-agent/src/prompts/tools/eval.md`
 - Key collaborators:
   - `packages/coding-agent/src/eval/backend.ts` — backend execution contract
+  - `packages/coding-agent/src/eval/agent-bridge.ts` — host-side `agent()` bridge into the subagent executor
   - `packages/coding-agent/src/eval/js/executor.ts` — JS backend adapter
   - `packages/coding-agent/src/eval/js/worker-core.ts` — JS execution, VM context, display/log capture
   - `packages/coding-agent/src/eval/js/shared/prelude.txt` — JS global helper installer
@@ -130,12 +131,16 @@ Implemented in `packages/coding-agent/src/eval/js/worker-core.ts`, `packages/cod
   - `display`, `print`
   - `read`, `write`, `append`, `sort`, `uniq`, `counter`, `diff`, `tree`, `env`, `output`
   - `tool.<name>(args)` proxy for arbitrary session tool calls
-  - `llm(prompt, opts?)` for oneshot, stateless LLM calls (see _Oneshot LLM helper_ below)
+  - `completion(prompt, opts?)` for oneshot, stateless model calls (see _Oneshot completion helper_ below)
+  - `agent(prompt, opts?)` for a single subagent call, plus `parallel()` / `pipeline()` bounded-pool helpers (see _Subagent helper_ below)
 - JS helpers that touch the host/runtime boundary are async and `await`able; pure text helpers (`sort`, `uniq`, `counter`) return synchronously but may still be safely awaited.
 - JS helper signatures use a trailing options object rather than Python keyword arguments:
   - `await read(path, { offset?, limit? })`
   - `await tree(path = ".", { maxDepth?, hidden? })`
   - `sort(text, { reverse?, unique? })`, `uniq(text, { count? })`, `counter(items, { limit?, reverse? })`
+  - `await agent(prompt, { agentType?, model?, context?, label?, schema? })`
+  - `await parallel([() => agent("a"), () => agent("b")])`
+  - `await pipeline(items, stage1, stage2)`
 - `display(value)` behavior:
   - plain objects/arrays become JSON outputs
   - `{ type: "image", data, mimeType }` becomes an image output
@@ -156,7 +161,7 @@ Implemented in `packages/coding-agent/src/eval/py/executor.ts`, `packages/coding
   - initialize cwd / env / `sys.path`
   - execute `PYTHON_PRELUDE`
 - Python cells run in the runner's persistent asyncio event loop, so top-level `await` works; the prompt warns not to use `asyncio.run(...)`
-- The Python prelude defines helpers with the same surface as JS where practical, including `tool.<name>(args)` through a per-run loopback bridge
+- The Python prelude defines helpers with the same surface as JS where practical, including `tool.<name>(args)`, `completion(...)`, and `agent(...)` through a per-run loopback bridge
 - Synchronous statement blocks run in the default executor with ContextVar state copied in; the GIL still serializes bytecode execution, but awaited regions can interleave with sibling cells
 - Kernel `display_data` / `execute_result` messages map to:
   - `application/x-omp-status` → status event
@@ -167,13 +172,13 @@ Implemented in `packages/coding-agent/src/eval/py/executor.ts`, `packages/coding
   - `text/html` → HTML converted to markdown with `htmlToBasicMarkdown()`
 - Interactive stdin is rejected: `input_request` sends an empty reply, marks `stdinRequested`, and the executor returns exit code `1`
 
-### Oneshot LLM helper (`llm`)
+### Oneshot completion helper (`completion`)
 
-Both runtimes expose `llm()` — a single stateless completion against a model tier. It is intentionally minimal: no conversation history, no agent-visible tools, pure text in / text (or object) out. Implemented host-side in `packages/coding-agent/src/eval/llm-bridge.ts` and routed through the existing tool bridge under the reserved name `__llm__`.
+Both runtimes expose `completion()` — a single stateless completion against a model tier. It is intentionally minimal: no conversation history, no agent-visible tools, pure text in / text (or object) out. Implemented host-side in `packages/coding-agent/src/eval/completion-bridge.ts` and routed through the existing tool bridge under the reserved name `__completion__`.
 
 - Signatures:
-  - JS: `await llm(prompt, { model?, system?, schema? })`
-  - Python: `llm(prompt, *, model="default", system=None, schema=None)`
+  - JS: `await completion(prompt, { model?, system?, schema? })`
+  - Python: `completion(prompt, *, model="default", system=None, schema=None)`
 - `model` selects a tier (default `"default"`):
   - `"smol"` → `pi/smol` role (fast / cheap)
   - `"default"` → the session's active model, falling back to the `pi/default` role
@@ -181,6 +186,21 @@ Both runtimes expose `llm()` — a single stateless completion against a model t
 - `system` (optional) supplies a system prompt.
 - `schema` (optional) is a plain JSON-Schema object. When present, the model is forced to call a single synthetic `respond` tool with that schema (loose, non-strict), and the helper returns the parsed object. When absent, the helper returns the completion string.
 - Errors surface as exceptions: unresolved tier, missing API key, an `error`/`aborted` stop reason, or empty output each raise.
+
+### Subagent helper (`agent`)
+
+Both runtimes expose `agent()` — a single subagent invocation routed through `packages/coding-agent/src/eval/agent-bridge.ts` into the same `runSubprocess(...)` path used by the `task` tool. It uses the current eval session's spawn policy and inherits the parent eval executor id, so parent and subagent code share JS/Python runtime state.
+
+- Signatures:
+  - JS: `await agent(prompt, { agentType?, model?, context?, label?, schema? })`
+  - Python: `agent(prompt, *, agent_type="task", model=None, context=None, label=None, schema=None)`
+- `agentType` / `agent_type` defaults to the bundled `task` agent and resolves through normal agent discovery, so project and user agents work.
+- `model` overrides the selected agent's model. Without it, normal per-agent settings and the agent frontmatter model apply.
+- `context` supplies shared background; `label` controls the `agent://<id>` output label prefix.
+- `schema` passes a JSON Schema to the subagent structured-output path. When present, the helper parses the final JSON text and returns an object.
+- Spawn restrictions use `session.getSessionSpawns()` exactly like the `task` tool. Eval-driven subagent recursion is capped at depth 3.
+- JS and Python both expose `parallel(thunks)` and `pipeline(items, ...stages)`; both use a bounded async/threaded pool whose width tracks the `task.maxConcurrency` setting (the same ceiling the `task` tool uses; `0` = run every item at once), preserve item order, and propagate rejections. The width is fetched live from the host via the `__concurrency__` bridge, so the helpers no longer take a `concurrency` argument.
+- Errors surface as exceptions: unknown or disabled agent, disallowed spawn, recursion cap, subagent failure, or invalid structured output all fail the eval cell.
 
 ### Multi-language call behavior
 
@@ -202,12 +222,14 @@ A single tool call can mix Python and JS cells. Persistence is per language runt
 - Subprocesses / native bindings
   - Python availability check runs `<python> -c ...`.
   - Python backend spawns one `python -u runner.py` subprocess per kernel; cancellation sends `SIGINT`. Details in `docs/python-repl.md`.
+  - `agent()` runs one in-process subagent via the task executor; that subagent may use its configured tools.
 - Session state
   - `session.assertEvalExecutionAllowed?.()` can block execution.
   - `session.trackEvalExecution?.(...)` can register cancellable eval work.
   - `session.getSessionFile?.()`, `session.getEvalSessionId?.()`, and `session.getEvalKernelOwnerId?.()` influence VM/kernel reuse and artifact lookup.
   - JS VM contexts persist across eval calls until reset/disposal.
   - Python retained kernels persist until reset, owner cleanup, or process exit.
+  - `agent()` allocates `agent://<id>` output artifacts and reuses the parent's eval executor id.
 - User-visible prompts / interactive UI
   - none; stdin requests are rejected programmatically
 - Background work / cancellation
@@ -223,6 +245,8 @@ A single tool call can mix Python and JS cells. Persistence is per language runt
 - Output truncation window: 50KB default (`DEFAULT_MAX_BYTES` in `packages/coding-agent/src/session/streaming-output.ts`)
 - Output line cap inside truncation helpers: 3000 lines (`DEFAULT_MAX_LINES` in `packages/coding-agent/src/session/streaming-output.ts`)
 - Streaming tail buffer for live updates: `DEFAULT_MAX_BYTES * 2` = 100KB (`packages/coding-agent/src/tools/eval.ts`)
+- JS/Python `parallel()` / `pipeline()` helper pool width: the `task.maxConcurrency` setting (default 32; `0` = unbounded), resolved live via the `__concurrency__` bridge (`packages/coding-agent/src/eval/concurrency-bridge.ts`)
+- Eval-driven `agent()` recursion cap: task depth 3 (`EVAL_AGENT_MAX_DEPTH`)
 - Python retained kernel idle timeout: 5 minutes (`IDLE_TIMEOUT_MS` in `packages/coding-agent/src/eval/py/executor.ts`)
 - Python retained kernel cap: 4 sessions (`MAX_KERNEL_SESSIONS` in `packages/coding-agent/src/eval/py/executor.ts`)
 - Python retained kernel cleanup sweep: every 30s (`CLEANUP_INTERVAL_MS` in `packages/coding-agent/src/eval/py/executor.ts`)

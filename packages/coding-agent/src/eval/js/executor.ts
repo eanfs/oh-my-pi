@@ -1,13 +1,22 @@
 import { DEFAULT_MAX_BYTES, OutputSink } from "../../session/streaming-output";
 import type { ToolSession } from "../../tools";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../../tools/output-meta";
+import { isEvalTimeoutControlEvent } from "../bridge-timeout";
 import { executeInVmContext, type JsDisplayOutput } from "./context-manager";
+import type { JsStatusEvent } from "./shared/types";
 
 export interface JsExecutorOptions {
 	cwd?: string;
 	timeoutMs?: number;
 	deadlineMs?: number;
+	/**
+	 * Runtime-work budget (ms). Used for worker cold-start headroom and
+	 * timeout-annotation text when the caller drives cancellation via the eval
+	 * watchdog `signal` instead of `deadlineMs`/`timeoutMs`. Never arms a timer.
+	 */
+	idleTimeoutMs?: number;
 	onChunk?: (chunk: string) => Promise<void> | void;
+	onStatus?: (event: JsStatusEvent) => void;
 	signal?: AbortSignal;
 	sessionId: string;
 	reset?: boolean;
@@ -15,6 +24,8 @@ export interface JsExecutorOptions {
 	artifactPath?: string;
 	artifactId?: string;
 	session: ToolSession;
+	/** On-disk roots the helpers substitute for internal-URL schemes (e.g. `local://`). */
+	localRoots?: Record<string, string>;
 }
 
 export interface JsResult {
@@ -44,6 +55,19 @@ function isAbortError(error: unknown): boolean {
 	);
 }
 
+function isTimeoutReason(reason: unknown): boolean {
+	return (
+		(reason instanceof DOMException && reason.name === "TimeoutError") ||
+		(reason instanceof Error && reason.name === "TimeoutError")
+	);
+}
+
+function formatJsTimeoutAnnotation(timeoutMs: number | undefined): string {
+	if (timeoutMs === undefined) return "Command timed out";
+	const secs = Math.max(1, Math.round(timeoutMs / 1000));
+	return `Command timed out after ${secs} seconds`;
+}
+
 export async function executeJs(code: string, options: JsExecutorOptions): Promise<JsResult> {
 	const displayOutputs: JsDisplayOutput[] = [];
 	const outputSink = new OutputSink({
@@ -54,15 +78,19 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 		maxColumns: resolveOutputMaxColumns(options.session.settings),
 		onChunk: chunk => options.onChunk?.(chunk),
 	});
-	const timeoutMs = getExecutionTimeoutMs(options);
+	const legacyTimeoutMs = getExecutionTimeoutMs(options);
 	const timeoutSignal =
-		typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
-			? AbortSignal.timeout(timeoutMs)
+		typeof legacyTimeoutMs === "number" && Number.isFinite(legacyTimeoutMs) && legacyTimeoutMs > 0
+			? AbortSignal.timeout(legacyTimeoutMs)
 			: undefined;
 	const signal =
 		options.signal && timeoutSignal
 			? AbortSignal.any([options.signal, timeoutSignal])
 			: (options.signal ?? timeoutSignal);
+	// The eval tool drives cancellation via its own watchdog `signal` and passes
+	// only the runtime-work budget; use it solely as worker cold-start headroom
+	// and never derive a competing fixed timer from it.
+	const acquireBudgetMs = legacyTimeoutMs ?? options.idleTimeoutMs;
 
 	try {
 		await executeInVmContext({
@@ -70,14 +98,21 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 			sessionId: options.sessionId,
 			cwd: options.cwd ?? options.session.cwd,
 			session: options.session,
+			localRoots: options.localRoots,
 			reset: options.reset,
 			code,
 			filename: `js-cell-${crypto.randomUUID()}.js`,
-			timeoutMs,
+			timeoutMs: acquireBudgetMs,
 			runState: {
 				signal,
 				onText: chunk => outputSink.push(chunk),
 				onDisplay: output => {
+					if (output.type === "status") {
+						// Timeout-control events drive the eval watchdog only; never
+						// store or render them as cell output.
+						options.onStatus?.(output.event);
+						if (isEvalTimeoutControlEvent(output.event)) return;
+					}
 					displayOutputs.push(output);
 				},
 			},
@@ -97,9 +132,9 @@ export async function executeJs(code: string, options: JsExecutorOptions): Promi
 		};
 	} catch (error) {
 		if (signal?.aborted || isAbortError(error)) {
-			const timeoutReason = timeoutSignal?.aborted ? "Command timed out" : "";
-			if (timeoutReason) {
-				outputSink.push(timeoutReason);
+			const timedOut = Boolean(timeoutSignal?.aborted) || isTimeoutReason(options.signal?.reason);
+			if (timedOut) {
+				outputSink.push(formatJsTimeoutAnnotation(legacyTimeoutMs ?? options.idleTimeoutMs));
 			}
 			const summary = await outputSink.dump();
 			return {

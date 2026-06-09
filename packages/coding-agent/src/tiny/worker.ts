@@ -1,7 +1,6 @@
 import * as fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import * as path from "node:path";
-import { parentPort } from "node:worker_threads";
 import type {
 	ProgressInfo,
 	TextGenerationPipeline,
@@ -11,6 +10,7 @@ import type {
 import { getTinyModelsCacheDir, isCompiledBinary, prompt } from "@oh-my-pi/pi-utils";
 import packageJson from "../../package.json" with { type: "json" };
 import tinyTitleSystemPrompt from "../prompts/system/tiny-title-system.md" with { type: "text" };
+import { installRuntimeModuleResolver, resolveRuntimeModule } from "./compiled-runtime";
 import { resolveTinyModelDevicePreference, type TinyModelDevice, tinyModelDeviceLoadOrder } from "./device";
 import { resolveTinyModelDtypeOverride, type TinyModelDtype } from "./dtype";
 import {
@@ -20,12 +20,7 @@ import {
 	type TinyTitleLocalModelSpec,
 } from "./models";
 import { formatTitleUserMessage, normalizeGeneratedTitle } from "./text";
-import type {
-	TinyTitleProgressEvent,
-	TinyTitleTransport,
-	TinyTitleWorkerInbound,
-	TinyTitleWorkerOutbound,
-} from "./title-protocol";
+import type { TinyTitleProgressEvent, TinyTitleTransport, TinyTitleWorkerInbound } from "./title-protocol";
 
 const TITLE_PREFILL = "<title>";
 const TITLE_CLOSE = "</title>";
@@ -34,6 +29,7 @@ const STOP_DECODE_WINDOW_TOKENS = 32;
 const MEMORY_COMPLETION_MAX_NEW_TOKENS = 256;
 const TINY_TITLE_SYSTEM_PROMPT = prompt.render(tinyTitleSystemPrompt);
 const TRANSFORMERS_PACKAGE = "@huggingface/transformers";
+const COMPILED_TRANSFORMERS_VERSION = process.env.PI_TINY_TRANSFORMERS_VERSION;
 const sourceRequire = createRequire(import.meta.url);
 const INSTALL_LOCK_ATTEMPTS = 240;
 const INSTALL_LOCK_SLEEP_MS = 250;
@@ -73,6 +69,7 @@ function resolveTransformersVersionSpec(): string {
 		manifest.optionalDependencies?.[TRANSFORMERS_PACKAGE] ?? manifest.dependencies?.[TRANSFORMERS_PACKAGE];
 	if (!versionSpec) throw new Error(`${TRANSFORMERS_PACKAGE} is missing from package.json optionalDependencies`);
 	if (!versionSpec.startsWith("catalog:")) return versionSpec;
+	if (COMPILED_TRANSFORMERS_VERSION) return COMPILED_TRANSFORMERS_VERSION;
 	const installed = sourceRequire(`${TRANSFORMERS_PACKAGE}/package.json`) as { version: string };
 	return installed.version;
 }
@@ -123,6 +120,7 @@ function getTinyTitleRuntimeDir(): string {
 
 async function acquireInstallLock(runtimeDir: string): Promise<() => Promise<void>> {
 	const lockDir = `${runtimeDir}.lock`;
+	await fs.mkdir(path.dirname(lockDir), { recursive: true });
 	for (let attempt = 0; attempt < INSTALL_LOCK_ATTEMPTS; attempt++) {
 		try {
 			await fs.mkdir(lockDir);
@@ -222,6 +220,23 @@ async function ensureCompiledTransformersRuntime(
 	}
 }
 
+/**
+ * Prepare the freshly-installed compiled runtime for loading: stub `sharp`
+ * (the tiny models are text-generation only, so the native image pipeline is
+ * dead weight) and patch the module resolver so Transformers.js's bare requires
+ * (`onnxruntime-node`, `onnxruntime-common`) resolve against the cache. Returns
+ * the absolute Transformers.js entrypoint to `require`.
+ */
+async function prepareCompiledRuntime(runtimeDir: string): Promise<string> {
+	const nodeModules = path.join(runtimeDir, "node_modules");
+	const sharpStub = path.join(runtimeDir, "omp-sharp-stub.cjs");
+	await Bun.write(sharpStub, "module.exports = {};\n");
+	installRuntimeModuleResolver({ runtimeNodeModules: nodeModules, stubs: { sharp: sharpStub } });
+	const entry = resolveRuntimeModule(nodeModules, TRANSFORMERS_PACKAGE);
+	if (!entry) throw new Error(`Unable to resolve ${TRANSFORMERS_PACKAGE} in compiled runtime at ${nodeModules}`);
+	return entry;
+}
+
 function configureTransformers(transformers: TransformersRuntime): TransformersRuntime {
 	transformers.env.cacheDir = getTinyModelsCacheDir();
 	transformers.env.allowLocalModels = false;
@@ -238,8 +253,9 @@ async function loadTransformers(
 	transformersRuntime = (async () => {
 		if (!isCompiledBinary()) return configureTransformers(sourceRequire(TRANSFORMERS_PACKAGE) as TransformersRuntime);
 		const runtimeDir = await ensureCompiledTransformersRuntime(transport, requestId, modelKey);
-		const require_ = createRequire(path.join(runtimeDir, "package.json"));
-		return configureTransformers(require_(TRANSFORMERS_PACKAGE) as TransformersRuntime);
+		const entry = await prepareCompiledRuntime(runtimeDir);
+		const require_ = createRequire(entry);
+		return configureTransformers(require_(entry) as TransformersRuntime);
 	})().catch(error => {
 		transformersRuntime = null;
 		throw error;
@@ -472,8 +488,8 @@ function buildCompletionPrompt(generator: TextGenerationPipeline, promptText: st
 }
 
 /**
- * Generic single-turn completion used by Mnemosyne memory tasks (fact extraction
- * and consolidation). The caller (Mnemosyne) supplies the full task prompt; we
+ * Generic single-turn completion used by Mnemopi memory tasks (fact extraction
+ * and consolidation). The caller (Mnemopi) supplies the full task prompt; we
  * wrap it as the user turn, decode greedily, and return the raw text for the
  * caller's own parser. Output is capped to keep local inference latency bounded.
  */
@@ -495,16 +511,6 @@ async function generateCompletion(
 	})) as TextGenerationStringOutput;
 	const generated = (output[0]?.generated_text ?? "").trim();
 	return generated === "" ? null : generated;
-}
-
-function releasePipelines(): void {
-	// Intentionally NOT calling `pipeline.dispose()`. transformers.js disposes the
-	// underlying onnxruntime InferenceSession, freeing native memory that Bun's
-	// worker/NAPI teardown then frees a second time — a double-free that aborts the
-	// process on quit ("malloc: pointer being freed was not allocated" /
-	// "NAPI FATAL ERROR"). The worker is torn down immediately after `close`, so the
-	// OS reclaims the model memory regardless; skipping dispose avoids the crash.
-	pipelines.clear();
 }
 
 function enqueueRequest(
@@ -555,33 +561,6 @@ export function startTinyTitleWorker(transport: TinyTitleTransport): void {
 			transport.send({ type: "pong", id: message.id });
 			return;
 		}
-		if (message.type === "close") {
-			releasePipelines();
-			transport.send({ type: "closed" });
-			transport.close();
-			return;
-		}
 		enqueueRequest(transport, message);
 	});
 }
-
-if (!parentPort) throw new Error("tiny-title-worker: missing parentPort");
-
-const port = parentPort;
-const transport: TinyTitleTransport = {
-	send: (message: TinyTitleWorkerOutbound) => port.postMessage(message),
-	onMessage: handler => {
-		const wrap = (data: unknown): void => handler(data as TinyTitleWorkerInbound);
-		port.on("message", wrap);
-		return () => port.off("message", wrap);
-	},
-	close: () => {
-		try {
-			port.close();
-		} catch {
-			// Already closed.
-		}
-	},
-};
-
-startTinyTitleWorker(transport);

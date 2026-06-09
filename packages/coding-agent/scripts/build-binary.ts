@@ -1,9 +1,19 @@
 #!/usr/bin/env bun
 
+import { createRequire } from "node:module";
 import * as path from "node:path";
 
 const packageDir = path.join(import.meta.dir, "..");
 const outputPath = path.join(packageDir, "dist", "omp");
+
+// Transformers.js is an optional, native-heavy dependency that is never bundled
+// into the binary; the tiny-model worker `bun install`s it into a runtime cache
+// on first use. The `catalog:` spec cannot be resolved from inside the compiled
+// bunfs (issue #1763), so embed the concrete installed version here for the
+// worker to pin its runtime install against.
+const transformersVersion = (
+	createRequire(import.meta.url)("@huggingface/transformers/package.json") as { version: string }
+).version;
 
 function shouldAdhocSignDarwinBinary(): boolean {
 	return process.platform === "darwin";
@@ -40,6 +50,8 @@ async function main(): Promise<void> {
 					"--keep-names",
 					"--define",
 					'process.env.PI_COMPILED="true"',
+					"--define",
+					`process.env.PI_TINY_TRANSFORMERS_VERSION=${JSON.stringify(transformersVersion)}`,
 					"--external",
 					"mupdf",
 					"--root",
@@ -56,7 +68,6 @@ async function main(): Promise<void> {
 					"../stats/src/sync-worker.ts",
 					"./src/tools/browser/tab-worker-entry.ts",
 					"./src/eval/js/worker-entry.ts",
-					"./src/tiny/worker.ts",
 					// Legacy pi-* extension compat entrypoints served by
 					// `legacy-pi-compat.ts`. These are reached via computed bunfs paths
 					// (which `--compile`'s static analyzer cannot trace), so each must be

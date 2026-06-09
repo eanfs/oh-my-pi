@@ -1,4 +1,16 @@
-export * from "../mnemosyne";
+export type {
+	MnemopiBackendConfig,
+	MnemopiLlmMode,
+	MnemopiProviderOptions,
+	MnemopiScoping,
+} from "../mnemopi/config";
+export type {
+	MnemopiMemoryEditOperation,
+	MnemopiMemoryEditOptions,
+	MnemopiMemoryEditResult,
+	MnemopiSessionState,
+	MnemopiSessionStateOptions,
+} from "../mnemopi/state";
 export * from "./local-backend";
 export * from "./off-backend";
 export * from "./resolve";

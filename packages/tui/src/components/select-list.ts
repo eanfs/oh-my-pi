@@ -1,7 +1,10 @@
+import { fuzzyFilter } from "../fuzzy";
 import { getKeybindings } from "../keybindings";
+import { extractPrintableText } from "../keys";
 import type { SymbolTheme } from "../symbols";
 import type { Component } from "../tui";
 import { Ellipsis, padding, replaceTabs, truncateToWidth, visibleWidth } from "../utils";
+import { ScrollView } from "./scroll-view";
 
 const DEFAULT_PRIMARY_COLUMN_WIDTH = 32;
 const PRIMARY_COLUMN_GAP = 2;
@@ -45,10 +48,13 @@ export interface SelectListLayoutOptions {
 	minPrimaryColumnWidth?: number;
 	maxPrimaryColumnWidth?: number;
 	truncatePrimary?: (context: SelectListTruncatePrimaryContext) => string;
+	/** Enable type-to-filter search when the item count exceeds maxVisible. Defaults to true. */
+	overflowSearch?: boolean;
 }
 
 export class SelectList implements Component {
 	#filteredItems: ReadonlyArray<SelectItem>;
+	#filterQuery = "";
 	#selectedIndex: number = 0;
 
 	onSelect?: (item: SelectItem) => void;
@@ -65,9 +71,7 @@ export class SelectList implements Component {
 	}
 
 	setFilter(filter: string): void {
-		this.#filteredItems = this.items.filter(item => item.value.toLowerCase().startsWith(filter.toLowerCase()));
-		// Reset selection when filter changes
-		this.#selectedIndex = 0;
+		this.#setFilter(filter, true);
 	}
 
 	setSelectedIndex(index: number): void {
@@ -80,10 +84,14 @@ export class SelectList implements Component {
 
 	render(width: number): string[] {
 		const lines: string[] = [];
+		const showSearchStatus = this.#shouldRenderSearchStatus();
 
 		// If no items match filter, show message
 		if (this.#filteredItems.length === 0) {
-			lines.push(this.theme.noMatch("  No matching commands"));
+			if (showSearchStatus) {
+				lines.push(this.#renderStatusLine(width));
+			}
+			lines.push(this.theme.noMatch("  No matching items"));
 			return lines;
 		}
 
@@ -97,28 +105,50 @@ export class SelectList implements Component {
 		const endIndex = Math.min(startIndex + this.maxVisible, this.#filteredItems.length);
 
 		// Render visible items
+		const overflow = this.#filteredItems.length > this.maxVisible;
+		const rowWidth = Math.max(0, width - (overflow ? 1 : 0));
+		const rows: string[] = [];
 		for (let i = startIndex; i < endIndex; i++) {
 			const item = this.#filteredItems[i];
 			if (!item) continue;
 
 			const isSelected = i === this.#selectedIndex;
 			const descriptionText = item.description ? sanitizeSingleLine(item.description) : undefined;
-			lines.push(this.#renderItem(item, isSelected, width, descriptionText, primaryColumnWidth));
+			rows.push(this.#renderItem(item, isSelected, rowWidth, descriptionText, primaryColumnWidth));
 		}
 
-		// Add scroll indicators if needed
-		if (startIndex > 0 || endIndex < this.#filteredItems.length) {
-			const scrollText = `  (${this.#selectedIndex + 1}/${this.#filteredItems.length})`;
-			// Truncate if too long for terminal
-			lines.push(this.theme.scrollInfo(truncateToWidth(scrollText, width - 2, Ellipsis.Omit)));
+		const sv = new ScrollView(rows, {
+			height: rows.length,
+			scrollbar: "auto",
+			totalRows: this.#filteredItems.length,
+			theme: { track: t => this.theme.scrollInfo(t), thumb: t => this.theme.selectedPrefix(t) },
+		});
+		sv.setScrollOffset(startIndex);
+		lines.push(...sv.render(width));
+
+		// Add search status when relevant (scrollbar now indicates overflow)
+		if (showSearchStatus) {
+			lines.push(this.#renderStatusLine(width));
 		}
 
 		return lines;
 	}
 
 	handleInput(keyData: string): void {
-		if (this.#filteredItems.length === 0) return;
 		const kb = getKeybindings();
+		// Escape or Ctrl+C
+		if (kb.matches(keyData, "tui.select.cancel")) {
+			if (this.onCancel) {
+				this.onCancel();
+			}
+			return;
+		}
+
+		if (this.#handleSearchInput(keyData)) {
+			return;
+		}
+
+		if (this.#filteredItems.length === 0) return;
 		// Up arrow - wrap to bottom when at top
 		if (kb.matches(keyData, "tui.select.up")) {
 			this.#selectedIndex = this.#selectedIndex === 0 ? this.#filteredItems.length - 1 : this.#selectedIndex - 1;
@@ -144,12 +174,6 @@ export class SelectList implements Component {
 			const selectedItem = this.#filteredItems[this.#selectedIndex];
 			if (selectedItem && this.onSelect) {
 				this.onSelect(selectedItem);
-			}
-		}
-		// Escape or Ctrl+C
-		else if (kb.matches(keyData, "tui.select.cancel")) {
-			if (this.onCancel) {
-				this.onCancel();
 			}
 		}
 	}
@@ -233,6 +257,64 @@ export class SelectList implements Component {
 
 	#getDisplayValue(item: SelectItem): string {
 		return sanitizeSingleLine(item.label || item.value);
+	}
+
+	#renderStatusLine(width: number): string {
+		const query = sanitizeSingleLine(this.#filterQuery);
+		const statusText = query ? `  Search: ${query}` : "  Type to search";
+		return this.theme.scrollInfo(truncateToWidth(statusText, Math.max(1, width - 2), Ellipsis.Omit));
+	}
+
+	#shouldRenderSearchStatus(): boolean {
+		return (
+			this.layout.overflowSearch !== false && (this.items.length > this.maxVisible || this.#filterQuery.length > 0)
+		);
+	}
+
+	#canEditSearch(): boolean {
+		return this.layout.overflowSearch !== false && this.items.length > this.maxVisible;
+	}
+
+	#handleSearchInput(keyData: string): boolean {
+		if (!this.#canEditSearch()) return false;
+
+		const kb = getKeybindings();
+		if (kb.matches(keyData, "tui.editor.deleteCharBackward")) {
+			if (this.#filterQuery.length === 0) return false;
+			const chars = [...this.#filterQuery];
+			chars.pop();
+			this.#setFilter(chars.join(""), true);
+			return true;
+		}
+
+		const printableText = extractPrintableText(keyData);
+		if (printableText === undefined) return false;
+		if (this.#filterQuery.length === 0 && printableText.trim().length === 0) return false;
+
+		this.#setFilter(this.#filterQuery + printableText, true);
+		return true;
+	}
+
+	#setFilter(filter: string, notify: boolean): void {
+		this.#filterQuery = filter;
+		this.#filteredItems = filter.trim()
+			? fuzzyFilter([...this.items], filter, item => this.#getFilterText(item))
+			: this.items;
+		this.#selectedIndex = 0;
+		if (notify) {
+			this.#notifySelectionChange();
+		}
+	}
+
+	#getFilterText(item: SelectItem): string {
+		let text = `${item.label} ${item.value}`;
+		if (item.description) {
+			text += ` ${item.description}`;
+		}
+		if (item.hint) {
+			text += ` ${item.hint}`;
+		}
+		return sanitizeSingleLine(text);
 	}
 
 	#notifySelectionChange(): void {

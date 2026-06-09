@@ -1,0 +1,143 @@
+{
+  "title": "企业级多租户 AI Agent 平台架构",
+  "heading": "Multi-Tenant AI Agent Platform",
+  "subtitle": "Client → AI Gateway → 多实例 RPC 内核（编排 + skills）→ microVM 执行层 · 一会话/租户一实例实现隔离",
+  "footer": "基于 oh-my-pi 内核（Pi fork）· RPC 模式 + AI Gateway + microVM 沙箱 · 由 deep-research 调研报告生成",
+
+  "header": [
+    {"label": "客户端 Client", "sublabel": "REST / SSE · WebSocket · MCP · gRPC", "color": "cyan"},
+    {"label": "LLM Providers · 40+", "sublabel": "经 injectable fetch + per-tenant egress 出站", "color": "slate", "style": "dashed"}
+  ],
+
+  "hero": {
+    "label": "AI Gateway · 对外接口层",
+    "sublabel": "鉴权 / 租户身份 · 限流配额 · 多模型路由与回退 · 用量计量与计费 · 审计 · prompt 防护",
+    "note": "REST+SSE 流式 · WebSocket(steer/abort/follow_up) · MCP 工具联邦 · gRPC↔内核",
+    "color": "amber"
+  },
+
+  "columns": [
+    {
+      "flow_label": "orchestration",
+      "groups": [
+        {
+          "title": "编排内核（RPC Kernel）", "subtitle": "Orchestration · 复用 oh-my-pi", "color": "emerald",
+          "items": [
+            {"name": "实例调度器 / 内核池", "detail": "一会话或一租户一实例\nK8s Pod · HPA 水平扩展", "color": "emerald"},
+            {"name": "RPC 内核实例", "detail": "JSONL 协议 · 50+ 命令 · 流式", "color": "emerald"},
+            {"name": "agent-loop 回合循环", "detail": "tool calling · 流式中断", "color": "emerald", "span": "half"},
+            {"name": "compaction 压缩", "detail": "本地/远程 · token 优化", "color": "emerald", "span": "half"},
+            {"name": "skills 引擎", "detail": "SKILL.md · capability 发现", "color": "emerald", "span": "half"},
+            {"name": "Task 子代理", "detail": "有界并发编排", "color": "emerald", "span": "half"},
+            {"name": "租户路由 Tenant Router", "detail": "会话↔实例映射 · 配额下发", "color": "amber"}
+          ]
+        }
+      ]
+    },
+    {
+      "flow_label": "execution",
+      "groups": [
+        {
+          "title": "执行层 · microVM 沙箱", "subtitle": "Untrusted Code · 内核级隔离（新增）", "color": "orange",
+          "items": [
+            {"name": "Kata / Firecracker microVM", "detail": "不可信代码内核级隔离\n~80–200ms 冷启动 · 满足 PCI/ISO/HIPAA", "color": "orange"},
+            {"name": "pi-iso 工作区隔离", "detail": "worktree / overlayfs / ProjFS", "color": "orange"},
+            {"name": "bash executor", "detail": "嵌入式 shell", "color": "orange", "span": "half"},
+            {"name": "eval Python/JS", "detail": "持久内核 cell", "color": "orange", "span": "half"},
+            {"name": "工具沙箱 Tools", "detail": "read/write/edit · LSP · browser", "color": "orange"},
+            {"name": "per-tenant egress 代理", "detail": "经 injectable fetch · 出站审计", "color": "rose"}
+          ]
+        }
+      ]
+    },
+    {
+      "flow_label": "state",
+      "groups": [
+        {
+          "title": "状态与数据", "subtitle": "Session State 外置", "color": "violet",
+          "items": [
+            {"name": "NDJSON 会话日志树", "detail": "event-sourced · 追加日志 · 天然 replay", "color": "violet"},
+            {"name": "对象存储 Object Store", "detail": "会话外置 S3 · 跨实例恢复", "color": "violet"},
+            {"name": "Redis 会话缓存", "detail": "热会话状态", "color": "violet", "span": "half"},
+            {"name": "元数据 DB", "detail": "租户/会话索引", "color": "violet", "span": "half"},
+            {"name": "Durable Execution", "detail": "可选 Temporal · 持久化+重放\n（非“保证完成”）", "color": "slate", "style": "dashed"}
+          ]
+        }
+      ]
+    },
+    {
+      "flow_label": "security/observability",
+      "groups": [
+        {
+          "title": "安全 · 凭据", "subtitle": "Security", "color": "rose",
+          "items": [
+            {"name": "Secrets Broker", "detail": "Vault · JIT 短时凭据 · 用后回收", "color": "rose"},
+            {"name": "per-session 凭据", "detail": "key 轮换 · 租户隔离", "color": "rose", "span": "half"},
+            {"name": "prompt/数据隔离", "detail": "上下文所有权边界", "color": "rose", "span": "half"}
+          ]
+        },
+        {
+          "title": "可观测 · 计费", "subtitle": "Observability", "color": "emerald",
+          "items": [
+            {"name": "OTel Collector", "detail": "GenAI semconv · tenant_id 维度\n默认不记 prompt 内容", "color": "emerald"},
+            {"name": "成本归因 / 计费", "detail": "per-tenant token 计量", "color": "emerald", "span": "half"},
+            {"name": "审计日志 Audit", "detail": "SOC2 / GDPR", "color": "emerald", "span": "half"}
+          ]
+        }
+      ]
+    }
+  ],
+
+  "legend": [
+    {"color": "cyan", "label": "对外接口 / 客户端"},
+    {"color": "amber", "label": "网关 / 路由"},
+    {"color": "emerald", "label": "编排内核 / 控制面"},
+    {"color": "orange", "label": "执行层 / microVM 沙箱"},
+    {"color": "violet", "label": "状态 / 存储"},
+    {"color": "rose", "label": "安全 / 凭据"}
+  ],
+  "arrow_label": "请求流",
+
+  "cards": [
+    {
+      "title": "对外接口形态", "color": "cyan",
+      "items": [
+        "REST + SSE — 单向流式补全输出",
+        "WebSocket — 双向 · steer/abort/follow_up",
+        "gRPC — 网关 ↔ 内核实例（内部低延迟）",
+        "MCP — skills/tools 联邦化暴露与接入",
+        "包装 RPC 模式 JSONL 协议（50+ 命令）"
+      ]
+    },
+    {
+      "title": "多实例租户隔离", "color": "orange",
+      "items": [
+        "一会话/租户一 RPC 内核实例（Silo 模型）",
+        "K8s namespace + RBAC + NetworkPolicy + Quota",
+        "⚠ 内核级隔离：Kata/Firecracker（不可信代码）",
+        "ResourceQuota / 专用节点池 抑制 noisy-neighbor",
+        "Silo → Bridge 分层演进（突破 ~1000 租户）"
+      ]
+    },
+    {
+      "title": "内核原语复用（oh-my-pi）", "color": "amber",
+      "items": [
+        "RPC 模式 → 对外接口底座",
+        "pi-iso → 工作区隔离（叠加 microVM）",
+        "NDJSON → event-sourced 状态外置",
+        "injectable fetch → per-tenant 网络路由",
+        "per-session 凭据 + OTel → 计费/审计"
+      ]
+    },
+    {
+      "title": "关键决策点", "color": "rose",
+      "items": [
+        "silo ↔ pool 切换阈值（租户数/客单价）",
+        "pi-iso 与 microVM 如何分层",
+        "NDJSON 自建重放 vs 引入 Temporal",
+        "网关选型 Kong / APISIX / 自建（含 MCP）",
+        "证伪项勿信：Temporal 保证完成 · BAU · SMTA 92%"
+      ]
+    }
+  ]
+}

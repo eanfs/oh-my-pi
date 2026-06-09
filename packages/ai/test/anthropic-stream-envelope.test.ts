@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { scheduler } from "node:timers/promises";
-import { Messages } from "@anthropic-ai/sdk/resources/messages/messages";
-import { streamAnthropic } from "../src/providers/anthropic";
-import type { AssistantMessageEvent, Context, Model, ProviderSessionState } from "../src/types";
+import { streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
+import { AnthropicMessages } from "@oh-my-pi/pi-ai/providers/anthropic-client";
+import type { AssistantMessageEvent, Context, Model, ProviderSessionState } from "@oh-my-pi/pi-ai/types";
 
 const model: Model<"anthropic-messages"> = {
 	id: "claude-sonnet-4-5",
@@ -34,6 +34,18 @@ const cityObjectSchema = {
 
 type MockAnthropicEvent = Record<string, unknown>;
 type MockAnthropicStream = AsyncIterable<MockAnthropicEvent>;
+
+// Provider session state is keyed per endpoint+model (`anthropic-messages:<baseUrl>\0<id>`),
+// with a legacy unscoped `anthropic-messages` key still honored. Look up the strict-tools
+// flag without depending on the exact key shape.
+function anthropicStrictToolsDisabled(map: Map<string, ProviderSessionState>): boolean | undefined {
+	for (const [key, value] of map) {
+		if (key === "anthropic-messages" || key.startsWith("anthropic-messages:")) {
+			return (value as { strictToolsDisabled?: boolean }).strictToolsDisabled;
+		}
+	}
+	return undefined;
+}
 type MockAnthropicRequest = {
 	withResponse(): Promise<{
 		data: MockAnthropicStream;
@@ -199,6 +211,43 @@ function createMalformedToolUseEvents(): MockAnthropicEvent[] {
 	];
 }
 
+function createUnterminatedToolUseSplicedReconnectEvents(): MockAnthropicEvent[] {
+	return [
+		{
+			type: "message_start",
+			message: {
+				id: "msg_tool_truncated",
+				usage: { input_tokens: 12, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+			},
+		},
+		// Tool call begins streaming but the transport drops before any argument
+		// bytes — and before `content_block_stop` — arrive, so `arguments` is still
+		// the seed `{}`.
+		{
+			type: "content_block_start",
+			index: 0,
+			content_block: { type: "tool_use", id: "tool_truncated", name: "lookup_weather", input: {} },
+		},
+		{ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "" } },
+		// A transparent reconnect splices a fresh message envelope onto the same
+		// stream. The duplicate `message_start` is deduped, but the orphaned tool
+		// block above is never closed and the reconnect supplies the terminal stop.
+		{
+			type: "message_start",
+			message: {
+				id: "msg_reconnect",
+				usage: { input_tokens: 12, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+			},
+		},
+		{
+			type: "message_delta",
+			delta: { stop_reason: "end_turn" },
+			usage: { input_tokens: 12, output_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+		},
+		{ type: "message_stop" },
+	];
+}
+
 function countEvents(events: AssistantMessageEvent[], type: AssistantMessageEvent["type"]): number {
 	return events.filter(event => event.type === type).length;
 }
@@ -209,7 +258,7 @@ afterEach(() => {
 
 describe("anthropic stream envelope handling", () => {
 	it("ignores duplicate message_start envelopes without resetting streamed text", async () => {
-		vi.spyOn(Messages.prototype, "create").mockImplementation(
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(
 			() => createMockRequest(createTextSuccessEvents("hello", { duplicateMessageStart: true })) as never,
 		);
 
@@ -231,7 +280,7 @@ describe("anthropic stream envelope handling", () => {
 
 	it("ignores ping before message_start and streams the response once", async () => {
 		let attempt = 0;
-		vi.spyOn(Messages.prototype, "create").mockImplementation(() => {
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(() => {
 			attempt += 1;
 			return createMockRequest(createTextSuccessEventsWithPreamble("hello", [{ type: "ping" }])) as never;
 		});
@@ -256,7 +305,7 @@ describe("anthropic stream envelope handling", () => {
 
 	it("ignores unknown preamble events before message_start and streams the response once", async () => {
 		let attempt = 0;
-		vi.spyOn(Messages.prototype, "create").mockImplementation(() => {
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(() => {
 			attempt += 1;
 			return createMockRequest(
 				createTextSuccessEventsWithPreamble("hello", [{ type: "custom_preamble_event", trace_id: "trace_123" }]),
@@ -281,9 +330,65 @@ describe("anthropic stream envelope handling", () => {
 		expect(result.content).toEqual([{ type: "text", text: "hello" }]);
 	});
 
+	it("ignores unknown content block envelopes while preserving known blocks", async () => {
+		const events: MockAnthropicEvent[] = [
+			{
+				type: "message_start",
+				message: {
+					id: "msg_unknown_block",
+					usage: {
+						input_tokens: 12,
+						output_tokens: 0,
+						cache_read_input_tokens: 0,
+						cache_creation_input_tokens: 0,
+					},
+				},
+			},
+			{
+				type: "content_block_start",
+				index: 0,
+				content_block: { type: "server_tool_use", id: "srv_1", name: "web_search" },
+			},
+			{
+				type: "content_block_delta",
+				index: 0,
+				delta: { type: "input_json_delta", partial_json: '{"query":"weather"}' },
+			},
+			{ type: "content_block_stop", index: 0 },
+			{ type: "content_block_start", index: 1, content_block: { type: "text", text: "" } },
+			{ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "hello" } },
+			{ type: "content_block_stop", index: 1 },
+			{
+				type: "message_delta",
+				delta: { stop_reason: "end_turn" },
+				usage: {
+					input_tokens: 12,
+					output_tokens: 4,
+					cache_read_input_tokens: 0,
+					cache_creation_input_tokens: 0,
+				},
+			},
+			{ type: "message_stop" },
+		];
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(() => createMockRequest(events) as never);
+
+		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const observed: AssistantMessageEvent[] = [];
+		for await (const event of stream) {
+			observed.push(event);
+		}
+		const result = await stream.result();
+
+		expect(countEvents(observed, "error")).toBe(0);
+		expect(countEvents(observed, "done")).toBe(1);
+		expect(result.stopReason).toBe("stop");
+		expect(result.responseId).toBe("msg_unknown_block");
+		expect(result.content).toEqual([{ type: "text", text: "hello" }]);
+	});
+
 	it("retries malformed envelopes before content starts without duplicating streamed text events", async () => {
 		let attempt = 0;
-		vi.spyOn(Messages.prototype, "create").mockImplementation(() => {
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(() => {
 			attempt += 1;
 			return createMockRequest(
 				attempt === 1 ? createMalformedPreMessageStartEvents() : createTextSuccessEvents("recovered"),
@@ -322,7 +427,7 @@ describe("anthropic stream envelope handling", () => {
 		const providerSessionState = new Map<string, ProviderSessionState>();
 		const strictFlags: boolean[][] = [];
 		let attempt = 0;
-		vi.spyOn(Messages.prototype, "create").mockImplementation((params: unknown) => {
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation((params: unknown) => {
 			attempt += 1;
 			strictFlags.push(getStrictFlags(params));
 			if (attempt === 1) {
@@ -344,10 +449,7 @@ describe("anthropic stream envelope handling", () => {
 		expect(countEvents(events, "done")).toBe(1);
 		expect(countEvents(events, "error")).toBe(0);
 		expect(strictFlags).toEqual([[true], [false]]);
-		expect(
-			(providerSessionState.get("anthropic-messages") as { strictToolsDisabled?: boolean } | undefined)
-				?.strictToolsDisabled,
-		).toBe(true);
+		expect(anthropicStrictToolsDisabled(providerSessionState)).toBe(true);
 
 		const nextStream = streamAnthropic(model, toolContext, { apiKey: "sk-ant-test", providerSessionState });
 		const nextEvents: AssistantMessageEvent[] = [];
@@ -378,7 +480,7 @@ describe("anthropic stream envelope handling", () => {
 		const providerSessionState = new Map<string, ProviderSessionState>();
 		const strictFlags: boolean[][] = [];
 		let attempt = 0;
-		vi.spyOn(Messages.prototype, "create").mockImplementation((params: unknown) => {
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation((params: unknown) => {
 			attempt += 1;
 			strictFlags.push(getStrictFlags(params));
 			return createRejectedMockRequest(createOtherInvalidRequestError()) as never;
@@ -397,15 +499,12 @@ describe("anthropic stream envelope handling", () => {
 		expect(countEvents(events, "error")).toBe(1);
 		expect(countEvents(events, "done")).toBe(0);
 		expect(strictFlags).toEqual([[true]]);
-		expect(
-			(providerSessionState.get("anthropic-messages") as { strictToolsDisabled?: boolean } | undefined)
-				?.strictToolsDisabled,
-		).toBe(false);
+		expect(anthropicStrictToolsDisabled(providerSessionState)).toBe(false);
 	});
 
-	it("does not retry malformed envelopes after partial tool-call content starts streaming", async () => {
+	it("finalizes a tool call with malformed argument JSON as best-effort content instead of erroring", async () => {
 		let attempt = 0;
-		vi.spyOn(Messages.prototype, "create").mockImplementation(() => {
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(() => {
 			attempt += 1;
 			return createMockRequest(createMalformedToolUseEvents()) as never;
 		});
@@ -421,20 +520,52 @@ describe("anthropic stream envelope handling", () => {
 		expect(countEvents(events, "toolcall_start")).toBe(1);
 		expect(countEvents(events, "toolcall_delta")).toBe(1);
 		expect(countEvents(events, "toolcall_end")).toBe(1);
-		expect(countEvents(events, "error")).toBe(1);
-		expect(countEvents(events, "done")).toBe(0);
-		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain("stream ended before terminal stop signal");
+		expect(countEvents(events, "error")).toBe(0);
+		expect(countEvents(events, "done")).toBe(1);
+		expect(result.stopReason).toBe("stop");
 
 		const toolCall = result.content[0];
 		expect(toolCall?.type).toBe("toolCall");
 		if (toolCall?.type !== "toolCall") {
-			throw new Error("Expected toolCall content in terminal error payload");
+			throw new Error("Expected toolCall content in degraded payload");
 		}
+		// Best-effort arguments recovered by the throttled streaming parser are retained.
+		expect(toolCall.arguments).toEqual({ city: "Par" });
 		expect("partialJson" in toolCall).toBe(false);
 	});
+
+	it("finalizes a tool call left open by a spliced reconnect instead of erroring", async () => {
+		let attempt = 0;
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(() => {
+			attempt += 1;
+			return createMockRequest(createUnterminatedToolUseSplicedReconnectEvents()) as never;
+		});
+
+		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+		const result = await stream.result();
+
+		// Non-fatal: the unterminated tool block is finalized with its seed `{}` arguments and the
+		// turn completes rather than erroring. Downstream argument validation handles the incomplete call.
+		expect(attempt).toBe(1);
+		expect(countEvents(events, "toolcall_start")).toBe(1);
+		expect(countEvents(events, "toolcall_end")).toBe(1);
+		expect(countEvents(events, "done")).toBe(1);
+		expect(countEvents(events, "error")).toBe(0);
+		expect(result.stopReason).toBe("stop");
+
+		const toolCall = result.content[0];
+		expect(toolCall?.type).toBe("toolCall");
+		if (toolCall?.type !== "toolCall") {
+			throw new Error("Expected toolCall content in degraded payload");
+		}
+		expect(toolCall.arguments).toEqual({});
+	});
 	it("parses raw SSE directly so unknown events do not fail Anthropic streams", async () => {
-		vi.spyOn(Messages.prototype, "create").mockImplementation(
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(
 			() =>
 				createRawSseRequest(
 					createTextSuccessSseFrames("hello", [
@@ -456,11 +587,13 @@ describe("anthropic stream envelope handling", () => {
 		expect(result.content).toEqual([{ type: "text", text: "hello" }]);
 	});
 
-	it("surfaces an error when a raw SSE stream closes before message_stop", async () => {
+	it("degrades to best-effort content when a raw SSE stream closes before message_stop", async () => {
 		const incompleteFrames = createTextSuccessSseFrames("partial").filter(
 			frame => !frame.includes("event: message_stop"),
 		);
-		vi.spyOn(Messages.prototype, "create").mockImplementation(() => createRawSseRequest(incompleteFrames) as never);
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(
+			() => createRawSseRequest(incompleteFrames) as never,
+		);
 
 		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
 		const events: AssistantMessageEvent[] = [];
@@ -469,14 +602,13 @@ describe("anthropic stream envelope handling", () => {
 		}
 		const result = await stream.result();
 
-		expect(countEvents(events, "error")).toBe(1);
-		expect(countEvents(events, "done")).toBe(0);
-		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain("stream ended before message_stop");
+		expect(countEvents(events, "error")).toBe(0);
+		expect(countEvents(events, "done")).toBe(1);
+		expect(result.stopReason).toBe("stop");
 		expect(result.content).toEqual([{ type: "text", text: "partial" }]);
 	});
 
-	it("repairs malformed JSON in raw SSE event data before parsing", async () => {
+	it("skips malformed raw SSE event frames and degrades to best-effort content", async () => {
 		const malformedTextDelta =
 			'{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"line\\qbreak"}}';
 		const successEvents = createTextSuccessEvents("unused");
@@ -488,16 +620,21 @@ describe("anthropic stream envelope handling", () => {
 			sseFrame("message_delta", successEvents[4]),
 			sseFrame("message_stop", { type: "message_stop" }),
 		];
-		vi.spyOn(Messages.prototype, "create").mockImplementation(() => createRawSseRequest(frames) as never);
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(() => createRawSseRequest(frames) as never);
 
 		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
-		for await (const _ of stream) {
-			// drain stream
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
 		}
 		const result = await stream.result();
 
+		// The unparseable content_block_delta frame is dropped; the surrounding text block streams
+		// empty and the turn completes normally.
+		expect(countEvents(events, "error")).toBe(0);
+		expect(countEvents(events, "done")).toBe(1);
 		expect(result.stopReason).toBe("stop");
-		expect(result.content).toEqual([{ type: "text", text: "line\\qbreak" }]);
+		expect(result.content).toEqual([{ type: "text", text: "" }]);
 	});
 	it("surfaces a refusal fallback message when stop_details is null", async () => {
 		const refusalEvents: MockAnthropicEvent[] = [
@@ -520,7 +657,9 @@ describe("anthropic stream envelope handling", () => {
 			},
 			{ type: "message_stop" },
 		];
-		vi.spyOn(Messages.prototype, "create").mockImplementation(() => createMockRequest(refusalEvents) as never);
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation(
+			() => createMockRequest(refusalEvents) as never,
+		);
 
 		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
 		const events: AssistantMessageEvent[] = [];
@@ -548,7 +687,7 @@ describe("anthropic stream envelope handling", () => {
 			],
 		};
 		const payloads: unknown[] = [];
-		vi.spyOn(Messages.prototype, "create").mockImplementation((params: unknown) => {
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation((params: unknown) => {
 			payloads.push(params);
 			return createMockRequest(createTextSuccessEvents("ok")) as never;
 		});
@@ -577,7 +716,7 @@ describe("anthropic stream envelope handling", () => {
 
 	it("emits 1h cache TTL only for canonical Anthropic API with compatible long-cache support", async () => {
 		const payloads: unknown[] = [];
-		vi.spyOn(Messages.prototype, "create").mockImplementation((params: unknown) => {
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation((params: unknown) => {
 			payloads.push(params);
 			return createMockRequest(createTextSuccessEvents("ok")) as never;
 		});

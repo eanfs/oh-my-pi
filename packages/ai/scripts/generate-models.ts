@@ -28,19 +28,32 @@ import {
 } from "../src/provider-models/descriptors";
 import {
 	buildXaiOAuthStaticSeed,
+	clampFireworksKimiMaxTokens,
+	isFireworksKimiK2ModelId,
 	MODELS_DEV_PROVIDER_DESCRIPTORS,
 	mapModelsDevToModels,
+	stripFireworksDeepSeekThinkingToggle,
 	UNK_CONTEXT_WINDOW,
 	UNK_MAX_TOKENS,
 } from "../src/provider-models/openai-compat";
 import { getGitLabDuoModels } from "../src/providers/gitlab-duo";
 import { JWT_CLAIM_PATH } from "../src/providers/openai-codex/constants";
+import type { OAuthProvider } from "../src/registry/oauth/types";
 import type { Model } from "../src/types";
 import { fetchAntigravityDiscoveryModels } from "../src/utils/discovery/antigravity";
 import { fetchCodexModels } from "../src/utils/discovery/codex";
-import type { OAuthProvider } from "../src/utils/oauth/types";
 
 const packageRoot = path.join(import.meta.dir, "..");
+
+/**
+ * Local/self-hosted providers (Ollama, vLLM, LM Studio, LiteLLM). Their model
+ * catalogs are whatever happens to be running on the machine that invokes the
+ * generator — bundling them would leak machine-specific endpoints (e.g.
+ * `http://localhost:4000/v1`) into the committed snapshot. They are discovered
+ * dynamically at runtime instead, so they are never fetched during generation
+ * and never written to models.json.
+ */
+const DISCOVERY_ONLY_PROVIDERS = new Set(["ollama", "vllm", "lm-studio", "litellm"]);
 
 async function resolveProviderApiKey(providerId: string, catalog: CatalogDiscoveryConfig): Promise<string | undefined> {
 	for (const envVar of catalog.envVars) {
@@ -212,6 +225,37 @@ function applyCodexPricingFallback(models: readonly Model[]): Model[] {
 	});
 }
 
+/**
+ * Fireworks-backed Kimi K2.x deployments report `max_completion_tokens: 65536`
+ * over `/v1/models`, but Kimi's documented output budget on Fireworks is
+ * lower (#1849). Cap them here so the post-processing pass — which also folds
+ * in the `prevModelsJson` static fallback used by `firepass` — never lets a
+ * stale or inflated upstream value through. The resolver applies the same
+ * cap when discovery runs at runtime; this is the bundle-time safety net.
+ */
+function applyFireworksKimiMaxTokensCap(models: readonly Model[]): Model[] {
+	const FIREWORKS_KIMI_PROVIDERS = new Set(["fireworks", "firepass"]);
+	return models.map(model => {
+		if (!FIREWORKS_KIMI_PROVIDERS.has(model.provider)) return model;
+		if (!isFireworksKimiK2ModelId(model.id)) return model;
+		const capped = clampFireworksKimiMaxTokens(model.id, model.maxTokens);
+		if (capped === model.maxTokens) return model;
+		return { ...model, maxTokens: capped };
+	});
+}
+
+/**
+ * Fireworks' DeepSeek V4 endpoint accepts the user's effort through
+ * `reasoning_effort` and rejects the DeepSeek-native binary `thinking` toggle
+ * when both are present. Strip stale reference metadata from generated fallbacks.
+ */
+function applyFireworksDeepSeekReasoningShape(models: readonly Model[]): Model[] {
+	return models.map(model => {
+		if (model.provider !== "fireworks" || model.api !== "openai-completions") return model;
+		return stripFireworksDeepSeekThinkingToggle(model, model.id);
+	});
+}
+
 const ANTIGRAVITY_ENDPOINT = "https://daily-cloudcode-pa.sandbox.googleapis.com";
 
 async function getOAuthAccessFromStorage(provider: OAuthProvider): Promise<OAuthAccess | null> {
@@ -314,7 +358,9 @@ async function generateModels() {
 	const modelsDevModels = await loadModelsDevData();
 	const catalogProviderModels = (
 		await Promise.all(
-			PROVIDER_DESCRIPTORS.filter(isCatalogDescriptor).map(descriptor => fetchProviderModelsFromCatalog(descriptor)),
+			PROVIDER_DESCRIPTORS.filter(
+				descriptor => isCatalogDescriptor(descriptor) && !DISCOVERY_ONLY_PROVIDERS.has(descriptor.providerId),
+			).map(descriptor => fetchProviderModelsFromCatalog(descriptor as CatalogProviderDescriptor)),
 		)
 	).flat();
 	const gitLabDuoModels = getGitLabDuoModels();
@@ -360,19 +406,21 @@ async function generateModels() {
 			modelsDevAuthoritativeProviders.add(model.provider);
 		}
 	}
+	if (catalogProviderModels.some(model => model.provider === "aimlapi")) {
+		modelsDevAuthoritativeProviders.add("aimlapi");
+	}
 	// Merge previous models.json entries as fallback for provider/model pairs not
 	// fetched dynamically. Providers that models.dev covers authoritatively keep
 	// the upstream list exactly, so retired entries from the previous snapshot do
 	// not reappear during regeneration.
 	// Discovery-only providers (local inference servers) — never bundle static models.
-	const discoveryOnlyProviders = new Set(["ollama", "vllm"]);
 	const fetchedKeys = new Set(allModels.map(model => `${model.provider}/${model.id}`));
 
 	for (const models of Object.values(prevModelsJson as Record<string, Record<string, Model>>)) {
 		for (const model of Object.values(models)) {
 			if (
 				!fetchedKeys.has(`${model.provider}/${model.id}`) &&
-				!discoveryOnlyProviders.has(model.provider) &&
+				!DISCOVERY_ONLY_PROVIDERS.has(model.provider) &&
 				!modelsDevAuthoritativeProviders.has(model.provider)
 			) {
 				allModels.push(model);
@@ -383,13 +431,15 @@ async function generateModels() {
 	allModels = applyGlobalModelsDevFallback(allModels, modelsDevModels);
 	allModels = applyPremiumMultiplierOverrides(allModels);
 	allModels = applyCodexPricingFallback(allModels);
+	allModels = applyFireworksKimiMaxTokensCap(allModels);
+	allModels = applyFireworksDeepSeekReasoningShape(allModels);
 	applyGeneratedModelPolicies(allModels);
 	linkOpenAIPromotionTargets(allModels);
 
 	// Group by provider and sort each provider's models
 	const providers: Record<string, Record<string, Model>> = {};
 	for (const model of allModels) {
-		if (discoveryOnlyProviders.has(model.provider)) continue;
+		if (DISCOVERY_ONLY_PROVIDERS.has(model.provider)) continue;
 		if (!providers[model.provider]) {
 			providers[model.provider] = {};
 		}

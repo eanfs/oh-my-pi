@@ -14,10 +14,25 @@ import * as piNatives from "@oh-my-pi/pi-natives";
 const ARTIFACT_HEAD_BYTES_DEFAULT = 20 * 1024;
 const BACKGROUND_COMPLETION_RACE_MS = 750;
 const KILL_MARKER_DELAY_SECONDS = "0.4";
-const KILL_MARKER_ASSERTION_WAIT_MS = 900;
+const KILL_MARKER_DELAY_MS = 400;
+// We prove a killed process never wrote its marker by observing until the
+// wall-clock instant the marker WOULD have appeared (spawn + delay) plus a
+// margin. Anchoring the deadline to a pre-spawn timestamp — instead of blindly
+// sleeping a fixed amount after executeBash returns — keeps the wait bounded
+// without shrinking the kill-propagation margin: the timeout/abort fires at
+// ~100ms, well before the 400ms marker write, so the margin between kill and
+// write is unchanged; only the redundant observation tail goes away.
+const KILL_MARKER_OBSERVE_MARGIN_MS = 300;
 
 function makeTempDir(): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "omp-bash-exec-"));
+}
+
+/** Spin-wait until the wall-clock deadline, polling rather than blind-sleeping. */
+async function waitUntil(deadlineMs: number): Promise<void> {
+	while (Date.now() < deadlineMs) {
+		await Bun.sleep(20);
+	}
 }
 
 describe("executeBash", () => {
@@ -173,10 +188,12 @@ describe("executeBash", () => {
 
 		const originalRun = piNatives.Shell.prototype.run;
 		let runCalls = 0;
+		const dispatched = Promise.withResolvers<void>();
 		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation(function (this: Shell, options, onChunk) {
 			runCalls++;
 			if (runCalls === 1) {
 				onChunk?.(null, "started\n");
+				dispatched.resolve();
 				return new Promise(() => {});
 			}
 			return originalRun.call(this, options, onChunk);
@@ -190,7 +207,7 @@ describe("executeBash", () => {
 			signal: controller.signal,
 			sessionKey: "hung-native-abort",
 		});
-		await Bun.sleep(50);
+		await dispatched.promise;
 		controller.abort();
 
 		const raced = await Promise.race([
@@ -220,8 +237,10 @@ describe("executeBash", () => {
 		}
 
 		const nativeResult = Promise.withResolvers<{ exitCode: undefined; cancelled: true; timedOut: false }>();
+		const dispatched = Promise.withResolvers<void>();
 		vi.spyOn(piNatives.Shell.prototype, "run").mockImplementation((_options, onChunk) => {
 			onChunk?.(null, "started\n");
+			dispatched.resolve();
 			return nativeResult.promise;
 		});
 		vi.spyOn(piNatives.Shell.prototype, "abort").mockResolvedValue();
@@ -233,7 +252,7 @@ describe("executeBash", () => {
 			signal: controller.signal,
 			sessionKey: "settled-native-abort",
 		});
-		await Bun.sleep(50);
+		await dispatched.promise;
 		controller.abort();
 		await promise;
 
@@ -312,13 +331,22 @@ describe("executeBash", () => {
 		expect(beforeAbort.output.trim()).toBe("alive");
 
 		const controller = new AbortController();
-		const abortPromise = executeBash("sleep 10", {
+		// Abort only once the command is actually running in the persistent
+		// session. Aborting on a fixed timer races executeBash's async setup
+		// (settings + snapshot load); under load the abort can land in the
+		// early-abort short-circuit before the shell ever runs, leaving the
+		// session unreset — the source of the flaky "alive" result here.
+		const startMarker = path.join(tempDir, "reset-on-abort.started");
+		const abortPromise = executeBash(`touch ${startMarker}; sleep 10`, {
 			cwd: tempDir,
 			timeout: 5000,
 			signal: controller.signal,
 			sessionKey,
 		});
-		await Bun.sleep(50);
+		const startDeadline = Date.now() + 4000;
+		while (!fs.existsSync(startMarker) && Date.now() < startDeadline) {
+			await Bun.sleep(2);
+		}
 		controller.abort();
 		const aborted = await abortPromise;
 		expect(aborted.cancelled).toBe(true);
@@ -519,6 +547,7 @@ describe("executeBash", () => {
 		const markerEscaped = marker.replace(/'/g, "'\\''");
 
 		// Command creates marker after a short delay, but we timeout before then.
+		const start = Date.now();
 		const result = await executeBash(`sleep ${KILL_MARKER_DELAY_SECONDS} && echo done > '${markerEscaped}'`, {
 			cwd: tempDir,
 			timeout: 100,
@@ -526,10 +555,9 @@ describe("executeBash", () => {
 
 		expect(result.cancelled).toBe(true);
 
-		// Wait longer than the command would have needed to create the marker.
-		await Bun.sleep(KILL_MARKER_ASSERTION_WAIT_MS);
-
-		// If process was killed (not orphaned), marker should NOT exist
+		// Observe past the instant the marker would have been written had the
+		// process survived. If it was killed (not orphaned), it never appears.
+		await waitUntil(start + KILL_MARKER_DELAY_MS + KILL_MARKER_OBSERVE_MARGIN_MS);
 		expect(fs.existsSync(marker)).toBe(false);
 	});
 
@@ -539,6 +567,7 @@ describe("executeBash", () => {
 		const marker = path.join(tempDir, "marker-bg.txt");
 		const markerEscaped = marker.replace(/'/g, "'\\''");
 
+		const start = Date.now();
 		const result = await executeBash(
 			`{ sleep ${KILL_MARKER_DELAY_SECONDS}; echo done > '${markerEscaped}'; } & sleep 10`,
 			{
@@ -549,7 +578,7 @@ describe("executeBash", () => {
 
 		expect(result.cancelled).toBe(true);
 
-		await Bun.sleep(KILL_MARKER_ASSERTION_WAIT_MS);
+		await waitUntil(start + KILL_MARKER_DELAY_MS + KILL_MARKER_OBSERVE_MARGIN_MS);
 		expect(fs.existsSync(marker)).toBe(false);
 	});
 
@@ -557,11 +586,15 @@ describe("executeBash", () => {
 		if (process.platform === "win32") return;
 
 		const marker = path.join(tempDir, "marker-bg-abort.txt");
+		const release = path.join(tempDir, "marker-bg-abort.release");
+		const started = path.join(tempDir, "marker-bg-abort.started");
 		const markerEscaped = marker.replace(/'/g, "'\\''");
+		const releaseEscaped = release.replace(/'/g, "'\\''");
+		const startedEscaped = started.replace(/'/g, "'\\''");
 		const controller = new AbortController();
 
 		const promise = executeBash(
-			`{ sleep ${KILL_MARKER_DELAY_SECONDS}; echo done > '${markerEscaped}'; } & sleep 10`,
+			`{ touch '${startedEscaped}'; while [ ! -f '${releaseEscaped}' ]; do sleep 0.05; done; echo done > '${markerEscaped}'; } & sleep 10`,
 			{
 				cwd: tempDir,
 				timeout: 10000,
@@ -569,14 +602,24 @@ describe("executeBash", () => {
 			},
 		);
 
-		await Bun.sleep(100);
+		const startDeadline = Date.now() + 4000;
+		while (!fs.existsSync(started) && Date.now() < startDeadline) {
+			await Bun.sleep(2);
+		}
+		expect(fs.existsSync(started)).toBe(true);
 		controller.abort();
 		const result = await promise;
 
 		expect(result.cancelled).toBe(true);
 		expect(result.output).toContain("Command cancelled");
 
-		await Bun.sleep(KILL_MARKER_ASSERTION_WAIT_MS);
+		// The backgrounded subshell only writes its marker once `release` exists.
+		// If abort failed to kill the process group, the orphan is still polling
+		// for `release` every 50ms — touching it makes a survivor react within one
+		// poll. A short settle first lets the kill signal propagate before we probe.
+		await Bun.sleep(100);
+		fs.writeFileSync(release, "");
+		await Bun.sleep(200);
 		expect(fs.existsSync(marker)).toBe(false);
 	});
 
@@ -588,6 +631,7 @@ describe("executeBash", () => {
 		const controller = new AbortController();
 
 		// Command creates marker after a short delay.
+		const start = Date.now();
 		const promise = executeBash(`sleep ${KILL_MARKER_DELAY_SECONDS} && echo done > '${markerEscaped}'`, {
 			cwd: tempDir,
 			timeout: 10000,
@@ -602,10 +646,9 @@ describe("executeBash", () => {
 		expect(result.cancelled).toBe(true);
 		expect(result.output).toContain("Command cancelled");
 
-		// Wait longer than the command would have needed to create the marker.
-		await Bun.sleep(KILL_MARKER_ASSERTION_WAIT_MS);
-
-		// If process was killed (not orphaned), marker should NOT exist
+		// Observe past the instant the marker would have been written had the
+		// process survived. If it was killed (not orphaned), it never appears.
+		await waitUntil(start + KILL_MARKER_DELAY_MS + KILL_MARKER_OBSERVE_MARGIN_MS);
 		expect(fs.existsSync(marker)).toBe(false);
 	});
 });

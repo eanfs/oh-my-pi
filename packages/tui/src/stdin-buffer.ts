@@ -233,9 +233,10 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 				return { sequences, remainder: remaining };
 			}
 		} else {
-			// Not an escape sequence - take a single character
-			sequences.push(remaining[0]!);
-			pos++;
+			// Not an escape sequence - take one Unicode scalar, not a UTF-16 code unit.
+			const char = Array.from(remaining)[0] ?? "";
+			sequences.push(char);
+			pos += char.length;
 		}
 	}
 
@@ -244,8 +245,8 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 
 export type StdinBufferOptions = {
 	/**
-	 * Maximum time to wait for sequence completion (default: 10ms)
-	 * After this time, the buffer is flushed even if incomplete
+	 * Maximum time to wait for sequence completion (default: 75ms).
+	 * After this time, a genuinely incomplete escape is flushed.
 	 */
 	timeout?: number;
 };
@@ -264,12 +265,13 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	#timeout?: NodeJS.Timeout;
 	readonly #timeoutMs: number;
 	#pasteMode: boolean = false;
-	#pasteBuffer: string = "";
+	#pasteChunks: string[] = [];
+	#pasteOverlap: string = "";
 	#pendingKittyPrintableCodepoint: number | undefined;
 
 	constructor(options: StdinBufferOptions = {}) {
 		super();
-		this.#timeoutMs = options.timeout ?? 10;
+		this.#timeoutMs = options.timeout ?? 75;
 	}
 
 	process(data: string | Buffer): void {
@@ -301,24 +303,9 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.#buffer += str;
 
 		if (this.#pasteMode) {
-			this.#pasteBuffer += this.#buffer;
+			const chunk = this.#buffer;
 			this.#buffer = "";
-
-			const endIndex = this.#pasteBuffer.indexOf(BRACKETED_PASTE_END);
-			if (endIndex !== -1) {
-				const pastedContent = this.#pasteBuffer.slice(0, endIndex);
-				const remaining = this.#pasteBuffer.slice(endIndex + BRACKETED_PASTE_END.length);
-
-				this.#pasteMode = false;
-				this.#pasteBuffer = "";
-				this.#pendingKittyPrintableCodepoint = undefined;
-
-				this.emit("paste", pastedContent);
-
-				if (remaining.length > 0) {
-					this.process(remaining);
-				}
-			}
+			this.#consumePasteChunk(chunk);
 			return;
 		}
 
@@ -334,25 +321,12 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 
 			this.#pendingKittyPrintableCodepoint = undefined;
 			this.#buffer = this.#buffer.slice(startIndex + BRACKETED_PASTE_START.length);
-			this.#pasteMode = true;
-			this.#pasteBuffer = this.#buffer;
+			const firstChunk = this.#buffer;
 			this.#buffer = "";
-
-			const endIndex = this.#pasteBuffer.indexOf(BRACKETED_PASTE_END);
-			if (endIndex !== -1) {
-				const pastedContent = this.#pasteBuffer.slice(0, endIndex);
-				const remaining = this.#pasteBuffer.slice(endIndex + BRACKETED_PASTE_END.length);
-
-				this.#pasteMode = false;
-				this.#pasteBuffer = "";
-				this.#pendingKittyPrintableCodepoint = undefined;
-
-				this.emit("paste", pastedContent);
-
-				if (remaining.length > 0) {
-					this.process(remaining);
-				}
-			}
+			this.#pasteMode = true;
+			this.#pasteChunks = [];
+			this.#pasteOverlap = "";
+			this.#consumePasteChunk(firstChunk);
 			return;
 		}
 
@@ -371,6 +345,42 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 					this.#emitDataSequence(sequence);
 				}
 			}, this.#timeoutMs);
+		}
+	}
+
+	/**
+	 * Consume one chunk of paste-mode input. Chunks are accumulated in an array
+	 * and only joined once the end marker arrives, so a large paste delivered in
+	 * many small terminal reads stays O(total) instead of the O(total^2) cost of
+	 * re-concatenating and rescanning the whole buffer on every chunk. A short
+	 * overlap tail (end-marker length - 1) is carried across chunk boundaries so
+	 * a marker split between two reads is still detected without rescanning.
+	 */
+	#consumePasteChunk(chunk: string): void {
+		const probe = this.#pasteOverlap + chunk;
+		if (probe.indexOf(BRACKETED_PASTE_END) === -1) {
+			this.#pasteChunks.push(chunk);
+			const keep = BRACKETED_PASTE_END.length - 1;
+			this.#pasteOverlap = probe.length > keep ? probe.slice(probe.length - keep) : probe;
+			return;
+		}
+
+		// End marker arrived: join once and split at its first occurrence,
+		// matching the prior indexOf-from-start semantics exactly.
+		const flat = this.#pasteChunks.length > 0 ? `${this.#pasteChunks.join("")}${chunk}` : chunk;
+		const endIndex = flat.indexOf(BRACKETED_PASTE_END);
+		const pastedContent = flat.slice(0, endIndex);
+		const remaining = flat.slice(endIndex + BRACKETED_PASTE_END.length);
+
+		this.#pasteMode = false;
+		this.#pasteChunks = [];
+		this.#pasteOverlap = "";
+		this.#pendingKittyPrintableCodepoint = undefined;
+
+		this.emit("paste", pastedContent);
+
+		if (remaining.length > 0) {
+			this.process(remaining);
 		}
 	}
 
@@ -408,7 +418,8 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		}
 		this.#buffer = "";
 		this.#pasteMode = false;
-		this.#pasteBuffer = "";
+		this.#pasteChunks = [];
+		this.#pasteOverlap = "";
 		this.#pendingKittyPrintableCodepoint = undefined;
 	}
 

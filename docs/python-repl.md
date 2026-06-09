@@ -10,6 +10,7 @@ It covers tool behavior, runner lifecycle, environment handling, execution seman
 - Subprocess kernel client: `src/eval/py/kernel.ts`
 - Python wrapper / NDJSON server: `src/eval/py/runner.py`
 - Prelude helpers loaded into every kernel: `src/eval/py/prelude.py`
+- Host-side subagent helper bridge: `src/eval/agent-bridge.ts`
 - MIME bundle renderer (text + structured outputs): `src/eval/py/display.ts`
 - Interactive-mode renderer for user-triggered Python runs: `src/modes/components/eval-execution.ts`
 - Runtime/env filtering and Python resolution: `src/eval/py/runtime.ts`
@@ -26,7 +27,7 @@ Tool params:
     language: "py" | "js";
     code: string;
     title?: string;
-    timeout?: number; // seconds, clamped to 1..600, default 30
+    timeout?: number; // seconds, clamped to 1..3600, default 30. Inactivity budget — see "Cell timeout".
     reset?: boolean; // reset this cell's selected runtime before execution
   }>;
 }
@@ -159,11 +160,15 @@ The runner additionally receives `PYTHONUNBUFFERED=1` and `PYTHONIOENCODING=utf-
 
 If Python preflight fails and `eval.js` is enabled, `eval` remains available for `js` cells; `py` cells fail with a Python-backend availability error.
 
+Python prelude helpers include `agent(prompt, *, agent_type="task", model=None, context=None, label=None, schema=None)`. It synchronously calls the host bridge, runs one subagent through the task executor, and returns the final text. When `schema` is supplied, the helper parses the subagent's JSON output and returns the object.
+
 ## Execution flow and cancellation/timeout
 
 ### Cell timeout
 
-Each eval cell timeout is in seconds, defaults to 30, and is clamped to `1..600`. The tool combines caller abort signal, session abort signal, and the current cell timeout with `AbortSignal.any(...)`.
+Each eval cell `timeout` is in seconds, defaults to 30, and is clamped to `1..600`. It is a **wall-clock budget on the cell's own work** that the watchdog (`IdleTimeout`, `src/eval/idle-timeout.ts`) enforces, **but it is paused while a host-side `agent()`/`parallel()`/`completion()` bridge call is in flight**: those calls pump a heartbeat (`withBridgeHeartbeat`, `src/eval/heartbeat.ts`) that re-arms the watchdog, so a long fanout or a slow completion runs to completion instead of being killed mid-stream.
+
+The heartbeat is the **sole** signal that extends the budget. Everything else the cell does — compute, `stdout`/`stderr`, `log()`/`phase()`, and ordinary (non-agent) tool calls — counts against `timeout`, so a cell that is not delegating to an agent/completion is bounded by a plain wall-clock timeout. The tool combines the caller abort signal, the session abort signal, and the watchdog's signal with `AbortSignal.any(...)`; no wall-clock deadline is passed to the backend, so neither runtime arms a competing fixed timer.
 
 ### Kernel execution cancellation
 
@@ -171,7 +176,7 @@ On abort/timeout:
 
 - The host sends `kill("SIGINT")` to the runner subprocess.
 - The runner's exec-time signal handler raises `KeyboardInterrupt` inside the user code.
-- Result includes `cancelled=true`; timeout path annotates output as `Command timed out after <n> seconds`.
+- Result includes `cancelled=true`; the timeout path annotates output as `Command timed out after <n> seconds`.
 - Between requests the runner installs `SIG_IGN` for SIGINT so a stray cancel does not tear down the kernel.
 
 If a second cancel is required (runner stuck in C code), the host escalates to `SIGTERM` and the session restarts on the next call.
@@ -227,7 +232,7 @@ Output is streamed through `OutputSink` and may be persisted to artifact storage
 
 - **Python backend not available** — Check `eval.py`, `PI_PY`, and that `python`/`python3` is on PATH. If preflight fails and `eval.js` is enabled, use a `js` cell.
 - **No Python on PATH** — Install a system Python 3.8+ or place a venv at `~/.omp/python-env`. `omp setup python --check` reports the resolved interpreter.
-- **Execution hangs then times out** — Increase tool `timeout` (max 600s) if workload is legitimate. For stuck native code, cancellation triggers `SIGINT` first then escalates; the session restarts on the next request.
+- **Execution hangs then times out** — Increase tool `timeout` (max 3600s) if workload is legitimate. For stuck native code, cancellation triggers `SIGINT` first then escalates; the session restarts on the next request.
 - **stdin/input prompts in Python code** — `input()` is not supported; pass data programmatically.
 - **Working directory errors** — Tool validates `cwd` exists and is a directory before execution.
 

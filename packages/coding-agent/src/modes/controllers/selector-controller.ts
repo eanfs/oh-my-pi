@@ -1,13 +1,13 @@
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import { getOAuthProviders } from "@oh-my-pi/pi-ai/utils/oauth";
-import type { OAuthProvider } from "@oh-my-pi/pi-ai/utils/oauth/types";
+import { PASTE_CODE_LOGIN_PROVIDERS } from "@oh-my-pi/pi-ai";
+import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
+import type { OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
 import type { Component, OverlayHandle } from "@oh-my-pi/pi-tui";
 import { Input, Loader, Spacer, Text } from "@oh-my-pi/pi-tui";
-import { getAgentDbPath, getProjectDir } from "@oh-my-pi/pi-utils";
+import { getAgentDbPath, getProjectDir, normalizePathForComparison } from "@oh-my-pi/pi-utils";
 import { getRoleInfo } from "../../config/model-registry";
 import { formatModelSelectorValue } from "../../config/model-resolver";
 import { settings } from "../../config/settings";
-import { DebugSelectorComponent } from "../../debug";
 import { disableProvider, enableProvider } from "../../discovery";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
@@ -36,9 +36,12 @@ import {
 	setPreferredImageProvider,
 	setPreferredSearchProvider,
 } from "../../tools";
+import { shortenPath } from "../../tools/render-utils";
+import { copyToClipboard } from "../../utils/clipboard";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { AgentDashboard } from "../components/agent-dashboard";
 import { AssistantMessageComponent } from "../components/assistant-message";
+import { CopySelectorComponent } from "../components/copy-selector";
 import { ExtensionDashboard } from "../components/extensions";
 import { HistorySearchComponent } from "../components/history-search";
 import { ModelSelectorComponent } from "../components/model-selector";
@@ -48,17 +51,12 @@ import { SessionObserverOverlayComponent } from "../components/session-observer-
 import { SessionSelectorComponent } from "../components/session-selector";
 import { SettingsSelectorComponent } from "../components/settings-selector";
 import { ToolExecutionComponent } from "../components/tool-execution";
+import { TranscriptBlock } from "../components/transcript-container";
 import { TreeSelectorComponent } from "../components/tree-selector";
 import { UserMessageSelectorComponent } from "../components/user-message-selector";
 import type { SessionObserverRegistry } from "../session-observer-registry";
-
-const CALLBACK_SERVER_PROVIDERS = new Set<OAuthProvider>([
-	"anthropic",
-	"openai-codex",
-	"gitlab-duo",
-	"google-gemini-cli",
-	"google-antigravity",
-]);
+import { computeContextBreakdown } from "../utils/context-usage";
+import { buildCopyTargets } from "../utils/copy-targets";
 
 const MANUAL_LOGIN_TIP = "Tip: You can complete pairing with /login <redirect URL>.";
 
@@ -132,7 +130,11 @@ export class SelectorController {
 							const availableWidth = this.ctx.editor.getTopBorderAvailableWidth(this.ctx.ui.terminal.columns);
 							return this.ctx.statusLine.getTopBorder(availableWidth).content;
 						},
-						onPluginsChanged: () => {
+						onPluginsChanged: async () => {
+							const projectPath = await resolveActiveProjectRegistryPath(this.ctx.sessionManager.getCwd());
+							clearPluginRootsAndCaches(projectPath ? [projectPath] : undefined);
+							await this.ctx.refreshSlashCommandState();
+							await this.ctx.session.refreshSshTool({ activateIfAvailable: true });
 							this.ctx.ui.requestRender();
 						},
 						onCancel: () => {
@@ -183,16 +185,19 @@ export class SelectorController {
 	 */
 	async showExtensionsDashboard(): Promise<void> {
 		const dashboard = await ExtensionDashboard.create(getProjectDir(), this.ctx.settings, this.ctx.ui.terminal.rows);
-		this.showSelector(done => {
-			dashboard.onClose = () => {
-				done();
-				this.ctx.ui.requestRender();
-			};
-			dashboard.onRequestRender = () => {
-				this.ctx.ui.requestRender();
-			};
-			return { component: dashboard, focus: dashboard };
+		const overlay = this.ctx.ui.showOverlay(dashboard, {
+			width: "100%",
+			maxHeight: "100%",
+			anchor: "top-left",
+			margin: 0,
 		});
+		dashboard.onClose = () => {
+			overlay.hide();
+			this.ctx.ui.requestRender();
+		};
+		dashboard.onRequestRender = () => {
+			this.ctx.ui.requestRender();
+		};
 	}
 
 	/**
@@ -207,16 +212,19 @@ export class SelectorController {
 			activeModelPattern,
 			defaultModelPattern,
 		});
-		this.showSelector(done => {
-			dashboard.onClose = () => {
-				done();
-				this.ctx.ui.requestRender();
-			};
-			dashboard.onRequestRender = () => {
-				this.ctx.ui.requestRender();
-			};
-			return { component: dashboard, focus: dashboard };
+		const overlay = this.ctx.ui.showOverlay(dashboard, {
+			width: "100%",
+			maxHeight: "100%",
+			anchor: "top-left",
+			margin: 0,
 		});
+		dashboard.onClose = () => {
+			overlay.hide();
+			this.ctx.ui.requestRender();
+		};
+		dashboard.onRequestRender = () => {
+			this.ctx.ui.requestRender();
+		};
 	}
 
 	/**
@@ -396,6 +404,7 @@ export class SelectorController {
 	}
 
 	showModelSelector(options?: { temporaryOnly?: boolean }): void {
+		const currentContextTokens = computeContextBreakdown(this.ctx.session).usedTokens;
 		this.showSelector(done => {
 			const selector = new ModelSelectorComponent(
 				this.ctx.ui,
@@ -426,6 +435,7 @@ export class SelectorController {
 							await this.ctx.session.setModel(model, role, {
 								selector,
 								thinkingLevel: concreteThinking,
+								persist: true,
 							});
 							if (isAuto) {
 								this.ctx.session.setThinkingLevel(AUTO_THINKING, true);
@@ -458,7 +468,7 @@ export class SelectorController {
 					done();
 					this.ctx.ui.requestRender();
 				},
-				options,
+				{ ...options, currentContextTokens },
 			);
 			return { component: selector, focus: selector };
 		});
@@ -584,6 +594,38 @@ export class SelectorController {
 			);
 			return { component: selector, focus: selector.getMessageList() };
 		});
+	}
+
+	showCopySelector(): void {
+		const targets = buildCopyTargets(this.ctx.session);
+		if (targets.length === 0) {
+			this.ctx.showStatus("Nothing to copy yet.");
+			return;
+		}
+
+		let overlayHandle: OverlayHandle | undefined;
+		const done = () => {
+			overlayHandle?.hide();
+			this.ctx.ui.requestRender();
+		};
+		const selector = new CopySelectorComponent(targets, {
+			onPick: target => {
+				done();
+				if (target.content === undefined) return;
+				void copyToClipboard(target.content);
+				this.ctx.showStatus(target.copyMessage ?? "Copied to clipboard");
+			},
+			onCancel: done,
+		});
+
+		overlayHandle = this.ctx.ui.showOverlay(selector, {
+			anchor: "bottom-center",
+			width: "100%",
+			maxHeight: "100%",
+			margin: 0,
+		});
+		this.ctx.ui.setFocus(selector);
+		this.ctx.ui.requestRender();
 	}
 
 	showTreeSelector(): void {
@@ -718,12 +760,22 @@ export class SelectorController {
 			this.ctx.sessionManager.getCwd(),
 			this.ctx.sessionManager.getSessionDir(),
 		);
+		// Current folder has no sessions: preload the global list so the picker
+		// can open straight into all-projects scope instead of dead-ending.
+		let allSessions: SessionInfo[] | undefined;
+		let startInAllScope = false;
+		if (sessions.length === 0) {
+			allSessions = await SessionManager.listAll();
+			startInAllScope = allSessions.length > 0;
+		}
+		const historyStorage = this.ctx.historyStorage;
+		const historyMatcher = historyStorage ? (query: string) => historyStorage.matchingSessionIds(query) : undefined;
 		this.showSelector(done => {
 			const selector = new SessionSelectorComponent(
 				sessions,
-				async sessionPath => {
+				async (session: SessionInfo) => {
 					done();
-					await this.handleResumeSession(sessionPath);
+					await this.handleResumeSession(session.path);
 				},
 				() => {
 					done();
@@ -732,19 +784,26 @@ export class SelectorController {
 				() => {
 					void this.ctx.shutdown();
 				},
-				async (session: SessionInfo) => {
-					if (!(await this.#detachActiveSessionBeforeDeletion(session.path))) {
-						return false;
-					}
-					const storage = new FileSessionStorage();
-					try {
-						await storage.deleteSessionWithArtifacts(session.path);
-						return true;
-					} catch (err) {
-						throw new Error(`Failed to delete session: ${err instanceof Error ? err.message : String(err)}`, {
-							cause: err,
-						});
-					}
+				{
+					onDelete: async (session: SessionInfo) => {
+						if (!(await this.#detachActiveSessionBeforeDeletion(session.path))) {
+							return false;
+						}
+						const storage = new FileSessionStorage();
+						try {
+							await storage.deleteSessionWithArtifacts(session.path);
+							return true;
+						} catch (err) {
+							throw new Error(`Failed to delete session: ${err instanceof Error ? err.message : String(err)}`, {
+								cause: err,
+							});
+						}
+					},
+					historyMatcher,
+					loadAllSessions: () => SessionManager.listAll(),
+					allSessions,
+					startInAllScope,
+					getTerminalRows: () => this.ctx.ui.terminal.rows,
 				},
 			);
 			selector.setOnRequestRender(() => this.ctx.ui.requestRender());
@@ -800,8 +859,17 @@ export class SelectorController {
 	async handleResumeSession(sessionPath: string): Promise<void> {
 		this.#clearTransientSessionUi();
 
-		// Switch session via AgentSession (emits hook and tool session events)
+		const previousCwd = this.ctx.sessionManager.getCwd();
+		// Switch session via AgentSession (emits hook and tool session events). The
+		// SessionManager adopts the resumed session's own cwd when it differs.
 		await this.ctx.session.switchSession(sessionPath);
+		const newCwd = this.ctx.sessionManager.getCwd();
+		const movedProject = normalizePathForComparison(newCwd) !== normalizePathForComparison(previousCwd);
+		if (movedProject) {
+			// Resumed a session from another project: re-point the process and every
+			// cwd-derived cache at it before rendering.
+			await this.ctx.applyCwdChange(newCwd);
+		}
 		this.#refreshSessionTerminalTitle();
 		this.ctx.updateEditorBorderColor();
 
@@ -809,7 +877,7 @@ export class SelectorController {
 		this.ctx.chatContainer.clear();
 		this.ctx.renderInitialMessages(undefined, { clearTerminalHistory: true });
 		await this.ctx.reloadTodos();
-		this.ctx.showStatus("Resumed session");
+		this.ctx.showStatus(movedProject ? `Resumed session in ${shortenPath(newCwd)}` : "Resumed session");
 	}
 
 	async handleSessionDeleteCommand(): Promise<void> {
@@ -853,32 +921,32 @@ export class SelectorController {
 	async #handleOAuthLogin(providerId: string): Promise<void> {
 		this.ctx.showStatus(`Logging in to ${providerId}…`);
 		const manualInput = this.ctx.oauthManualInput;
-		const useManualInput = CALLBACK_SERVER_PROVIDERS.has(providerId as OAuthProvider);
+		const useManualInput = PASTE_CODE_LOGIN_PROVIDERS.has(providerId);
 		try {
 			await this.ctx.session.modelRegistry.authStorage.login(providerId as OAuthProvider, {
 				onAuth: (info: { url: string; instructions?: string }) => {
-					this.ctx.chatContainer.addChild(new Spacer(1));
-					this.ctx.chatContainer.addChild(new Text(theme.fg("dim", info.url), 1, 0));
+					const block = new TranscriptBlock();
+					block.addChild(new Text(theme.fg("dim", info.url), 1, 0));
 					const hyperlink = `\x1b]8;;${info.url}\x07Click here to login\x1b]8;;\x07`;
-					this.ctx.chatContainer.addChild(new Text(theme.fg("accent", hyperlink), 1, 0));
+					block.addChild(new Text(theme.fg("accent", hyperlink), 1, 0));
 					if (info.instructions) {
-						this.ctx.chatContainer.addChild(new Spacer(1));
-						this.ctx.chatContainer.addChild(new Text(theme.fg("warning", info.instructions), 1, 0));
+						block.addChild(new Spacer(1));
+						block.addChild(new Text(theme.fg("warning", info.instructions), 1, 0));
 					}
 					if (useManualInput) {
-						this.ctx.chatContainer.addChild(new Spacer(1));
-						this.ctx.chatContainer.addChild(new Text(theme.fg("dim", MANUAL_LOGIN_TIP), 1, 0));
+						block.addChild(new Spacer(1));
+						block.addChild(new Text(theme.fg("dim", MANUAL_LOGIN_TIP), 1, 0));
 					}
-					this.ctx.ui.requestRender();
+					this.ctx.present(block);
 					this.ctx.openInBrowser(info.url);
 				},
 				onPrompt: async (prompt: { message: string; placeholder?: string }) => {
-					this.ctx.chatContainer.addChild(new Spacer(1));
-					this.ctx.chatContainer.addChild(new Text(theme.fg("warning", prompt.message), 1, 0));
+					const promptBlock = new TranscriptBlock();
+					promptBlock.addChild(new Text(theme.fg("warning", prompt.message), 1, 0));
 					if (prompt.placeholder) {
-						this.ctx.chatContainer.addChild(new Text(theme.fg("dim", prompt.placeholder), 1, 0));
+						promptBlock.addChild(new Text(theme.fg("dim", prompt.placeholder), 1, 0));
 					}
-					this.ctx.ui.requestRender();
+					this.ctx.present(promptBlock);
 					const { promise, resolve } = Promise.withResolvers<string>();
 					const codeInput = new Input();
 					codeInput.onSubmit = () => {
@@ -895,18 +963,17 @@ export class SelectorController {
 					return promise;
 				},
 				onProgress: (message: string) => {
-					this.ctx.chatContainer.addChild(new Text(theme.fg("dim", message), 1, 0));
-					this.ctx.ui.requestRender();
+					this.ctx.present(new Text(theme.fg("dim", message), 1, 0));
 				},
 				onManualCodeInput: useManualInput ? () => manualInput.waitForInput(providerId) : undefined,
 			});
 			await this.ctx.session.modelRegistry.refresh();
-			this.ctx.chatContainer.addChild(new Spacer(1));
-			this.ctx.chatContainer.addChild(
+			const block = new TranscriptBlock();
+			block.addChild(
 				new Text(theme.fg("success", `${theme.status.success} Successfully logged in to ${providerId}`), 1, 0),
 			);
-			this.ctx.chatContainer.addChild(new Text(theme.fg("dim", `Credentials saved to ${getAgentDbPath()}`), 1, 0));
-			this.ctx.ui.requestRender();
+			block.addChild(new Text(theme.fg("dim", `Credentials saved to ${getAgentDbPath()}`), 1, 0));
+			this.ctx.present(block);
 		} catch (error: unknown) {
 			this.ctx.showError(`Login failed: ${error instanceof Error ? error.message : String(error)}`);
 		} finally {
@@ -918,16 +985,28 @@ export class SelectorController {
 
 	async #handleOAuthLogout(providerId: string): Promise<void> {
 		try {
-			await this.ctx.session.modelRegistry.authStorage.logout(providerId);
+			const authStorage = this.ctx.session.modelRegistry.authStorage;
+			if (!authStorage.has(providerId)) {
+				const source = authStorage.describeCredentialSource(providerId, this.ctx.session.sessionId);
+				const suffix = source ? ` Current auth comes from ${source}; remove that source to log out.` : "";
+				this.ctx.showError(`Logout skipped: no stored credentials for ${providerId}.${suffix}`);
+				return;
+			}
+
+			await authStorage.logout(providerId);
 			await this.ctx.session.modelRegistry.refresh();
-			this.ctx.chatContainer.addChild(new Spacer(1));
-			this.ctx.chatContainer.addChild(
+			const block = new TranscriptBlock();
+			block.addChild(
 				new Text(theme.fg("success", `${theme.status.success} Successfully logged out of ${providerId}`), 1, 0),
 			);
-			this.ctx.chatContainer.addChild(
-				new Text(theme.fg("dim", `Credentials removed from ${getAgentDbPath()}`), 1, 0),
-			);
-			this.ctx.ui.requestRender();
+			block.addChild(new Text(theme.fg("dim", `Credentials removed from ${getAgentDbPath()}`), 1, 0));
+			const remainingSource = authStorage.describeCredentialSource(providerId, this.ctx.session.sessionId);
+			if (remainingSource) {
+				block.addChild(
+					new Text(theme.fg("warning", `${providerId} is still authenticated via ${remainingSource}`), 1, 0),
+				);
+			}
+			this.ctx.present(block);
 		} catch (error: unknown) {
 			this.ctx.showError(`Logout failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
@@ -947,10 +1026,10 @@ export class SelectorController {
 			await this.#refreshOAuthProviderAuthState();
 			const oauthProviders = getOAuthProviders();
 			const loggedInProviders = oauthProviders.filter(provider =>
-				this.ctx.session.modelRegistry.authStorage.hasAuth(provider.id),
+				this.ctx.session.modelRegistry.authStorage.has(provider.id),
 			);
 			if (loggedInProviders.length === 0) {
-				this.ctx.showStatus("No OAuth providers logged in. Use /login first.");
+				this.ctx.showStatus("No stored provider credentials to log out. Remove env or config auth at its source.");
 				return;
 			}
 		}
@@ -991,7 +1070,8 @@ export class SelectorController {
 		});
 	}
 
-	showDebugSelector(): void {
+	async showDebugSelector(): Promise<void> {
+		const { DebugSelectorComponent } = await import("../../debug");
 		this.showSelector(done => {
 			const selector = new DebugSelectorComponent(this.ctx, done);
 			return { component: selector, focus: selector };

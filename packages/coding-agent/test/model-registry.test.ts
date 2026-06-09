@@ -2,29 +2,63 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Effort, type Model, type OpenAICompat, type ThinkingConfig, writeModelCache } from "@oh-my-pi/pi-ai";
+import {
+	Effort,
+	type FetchImpl,
+	type Model,
+	type OpenAICompat,
+	type ThinkingConfig,
+	writeModelCache,
+} from "@oh-my-pi/pi-ai";
 import { kNoAuth, ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { hookFetch, Snowflake } from "@oh-my-pi/pi-utils";
+import { Snowflake } from "@oh-my-pi/pi-utils";
 
 describe("ModelRegistry", () => {
 	let tempDir: string;
 	let modelsJsonPath: string;
 	let cacheDbPath: string;
 	let authStorage: AuthStorage;
+	let originalOllamaBaseUrl: string | undefined;
+	let originalOllamaHost: string | undefined;
+	let originalOllamaContextLength: string | undefined;
 
 	beforeEach(async () => {
 		resetSettingsForTest();
+		originalOllamaBaseUrl = Bun.env.OLLAMA_BASE_URL;
+		originalOllamaHost = Bun.env.OLLAMA_HOST;
+		originalOllamaContextLength = Bun.env.OLLAMA_CONTEXT_LENGTH;
+		delete Bun.env.OLLAMA_BASE_URL;
+		delete Bun.env.OLLAMA_HOST;
+		delete Bun.env.OLLAMA_CONTEXT_LENGTH;
 		tempDir = path.join(os.tmpdir(), `pi-test-model-registry-${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
 		modelsJsonPath = path.join(tempDir, "models.json");
 		cacheDbPath = path.join(tempDir, "models.db");
-		authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
+		// In-memory auth DB: tests need a fresh, isolated credential store per case but
+		// never reopen it from disk, so :memory: avoids the WAL/chmod disk-open cost
+		// (~3ms/test) while preserving per-test isolation.
+		authStorage = await AuthStorage.create(":memory:");
 	});
 
 	afterEach(() => {
 		resetSettingsForTest();
+		if (originalOllamaBaseUrl === undefined) {
+			delete Bun.env.OLLAMA_BASE_URL;
+		} else {
+			Bun.env.OLLAMA_BASE_URL = originalOllamaBaseUrl;
+		}
+		if (originalOllamaHost === undefined) {
+			delete Bun.env.OLLAMA_HOST;
+		} else {
+			Bun.env.OLLAMA_HOST = originalOllamaHost;
+		}
+		if (originalOllamaContextLength === undefined) {
+			delete Bun.env.OLLAMA_CONTEXT_LENGTH;
+		} else {
+			Bun.env.OLLAMA_CONTEXT_LENGTH = originalOllamaContextLength;
+		}
 		authStorage.close();
 		if (tempDir && fs.existsSync(tempDir)) {
 			fs.rmSync(tempDir, { recursive: true });
@@ -95,6 +129,24 @@ describe("ModelRegistry", () => {
 		return model?.compat as OpenAICompat | undefined;
 	}
 
+	function withEnv(name: "OLLAMA_BASE_URL" | "OLLAMA_CONTEXT_LENGTH" | "OLLAMA_HOST", value: string | undefined) {
+		const original = Bun.env[name];
+		if (value === undefined) {
+			delete Bun.env[name];
+		} else {
+			Bun.env[name] = value;
+		}
+		return {
+			[Symbol.dispose]() {
+				if (original === undefined) {
+					delete Bun.env[name];
+				} else {
+					Bun.env[name] = original;
+				}
+			},
+		};
+	}
+
 	/** Create a baseUrl-only override (no custom models) */
 	function overrideConfig(baseUrl: string, headers?: Record<string, string>) {
 		return { baseUrl, ...(headers && { headers }) };
@@ -109,8 +161,8 @@ describe("ModelRegistry", () => {
 		fs.writeFileSync(modelsJsonPath, JSON.stringify(config));
 	}
 
-	function mockOpenAiCompatibleModels(url: string, modelIds: string[]) {
-		return hookFetch(input => {
+	function mockOpenAiCompatibleModels(url: string, modelIds: string[]): FetchImpl {
+		return async input => {
 			const requestUrl = String(input);
 			if (requestUrl === url) {
 				return new Response(JSON.stringify({ data: modelIds.map(id => ({ id })) }), {
@@ -119,26 +171,30 @@ describe("ModelRegistry", () => {
 				});
 			}
 			throw new Error(`Unexpected URL: ${requestUrl}`);
-		});
+		};
 	}
 
-	function mockOllamaDiscovery(modelNames: string[]) {
-		return hookFetch(input => {
+	function mockOllamaDiscovery(
+		modelNames: string[],
+		endpoint = "http://127.0.0.1:11434",
+		showPayload: Record<string, unknown> = { capabilities: ["completion"] },
+	): FetchImpl {
+		return async input => {
 			const url = String(input);
-			if (url === "http://127.0.0.1:11434/api/tags") {
+			if (url === `${endpoint}/api/tags`) {
 				return new Response(JSON.stringify({ models: modelNames.map(name => ({ name })) }), {
 					status: 200,
 					headers: { "Content-Type": "application/json" },
 				});
 			}
-			if (url === "http://127.0.0.1:11434/api/show") {
-				return new Response(JSON.stringify({ capabilities: ["completion"] }), {
+			if (url === `${endpoint}/api/show`) {
+				return new Response(JSON.stringify(showPayload), {
 					status: 200,
 					headers: { "Content-Type": "application/json" },
 				});
 			}
 			throw new Error(`Unexpected URL: ${url}`);
-		});
+		};
 	}
 
 	describe("canonical equivalence", () => {
@@ -632,6 +688,7 @@ describe("ModelRegistry", () => {
 					compat: {
 						supportsUsageInStreaming: false,
 						maxTokensField: "max_tokens",
+						cacheControlFormat: "anthropic",
 					},
 					models: [
 						{
@@ -651,6 +708,7 @@ describe("ModelRegistry", () => {
 			const compat = getOpenAICompat(model);
 			expect(compat?.supportsUsageInStreaming).toBe(false);
 			expect(compat?.maxTokensField).toBe("max_tokens");
+			expect(compat?.cacheControlFormat).toBe("anthropic");
 		});
 
 		test("model-level compat overrides provider-level compat for custom models", () => {
@@ -941,11 +999,11 @@ describe("ModelRegistry", () => {
 					"openai-responses",
 				),
 			});
-			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const fetchMock = mockOpenAiCompatibleModels("https://my-proxy.example.com/v1/models", ["gpt-5.4"]);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 			expect(registry.find("openai", "gpt-5.4")?.name).toBe("Proxy GPT-5.4");
 			expect(registry.find("openai", "gpt-5.4")?.contextWindow).toBe(256000);
 
-			using _hook = mockOpenAiCompatibleModels("https://my-proxy.example.com/v1/models", ["gpt-5.4"]);
 			await registry.refreshProvider("openai", "online");
 
 			const model = registry.find("openai", "gpt-5.4");
@@ -964,10 +1022,10 @@ describe("ModelRegistry", () => {
 					models: [{ id: "gpt-5.4" }],
 				},
 			});
-			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const fetchMock = mockOpenAiCompatibleModels("http://127.0.0.1:8080/models", ["gpt-5.4"]);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 			expect(registry.find("custom-local", "gpt-5.4")?.contextWindow).toBe(1_000_000);
 
-			using _hook = mockOpenAiCompatibleModels("http://127.0.0.1:8080/models", ["gpt-5.4"]);
 			await registry.refreshProvider("custom-local", "online");
 
 			const model = registry.find("custom-local", "gpt-5.4");
@@ -991,10 +1049,10 @@ describe("ModelRegistry", () => {
 					],
 				},
 			});
-			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const fetchMock = mockOpenAiCompatibleModels("https://my-proxy.example.com/v1/models", ["gpt-5.4"]);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 			expect(getOpenAICompat(registry.find("openai", "gpt-5.4"))?.extraBody).toEqual({ source: "proxy" });
 
-			using _hook = mockOpenAiCompatibleModels("https://my-proxy.example.com/v1/models", ["gpt-5.4"]);
 			await registry.refreshProvider("openai", "online");
 
 			expect(getOpenAICompat(registry.find("openai", "gpt-5.4"))?.extraBody).toEqual({ source: "proxy" });
@@ -1019,10 +1077,10 @@ describe("ModelRegistry", () => {
 					},
 				},
 			});
-			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const fetchMock = mockOpenAiCompatibleModels("https://my-proxy.example.com/v1/models", ["gpt-5.4"]);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 			expect(registry.find("openai", "gpt-5.4")?.contextWindow).toBe(512000);
 
-			using _hook = mockOpenAiCompatibleModels("https://my-proxy.example.com/v1/models", ["gpt-5.4"]);
 			await registry.refreshProvider("openai", "online");
 
 			expect(registry.find("openai", "gpt-5.4")?.contextWindow).toBe(512000);
@@ -1044,10 +1102,10 @@ describe("ModelRegistry", () => {
 					],
 				},
 			});
-			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const fetchMock = mockOpenAiCompatibleModels("https://provider.example.com/v1/models", ["gpt-5.4", "gpt-5.5"]);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 			expect(registry.find("openai", "gpt-5.4")?.baseUrl).toBe("https://special.example.com/v1");
 
-			using _hook = mockOpenAiCompatibleModels("https://provider.example.com/v1/models", ["gpt-5.4", "gpt-5.5"]);
 			await registry.refreshProvider("openai", "online");
 
 			const discovered = registry.find("openai", "gpt-5.5");
@@ -1403,6 +1461,51 @@ describe("ModelRegistry", () => {
 			)?.name;
 			expect(restoredName).not.toBe("Custom Name");
 		});
+
+		test("modelOverrides can set omitMaxOutputTokens on a built-in model", () => {
+			writeRawModelsJson({
+				openai: {
+					modelOverrides: {
+						"gpt-5.4": {
+							omitMaxOutputTokens: true,
+						},
+					},
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const model = registry.find("openai", "gpt-5.4");
+			expect(model?.omitMaxOutputTokens).toBe(true);
+			// maxTokens is still populated locally — only the wire emission is suppressed.
+			expect(model?.maxTokens).toBeGreaterThan(0);
+		});
+
+		test("custom model definitions accept omitMaxOutputTokens", () => {
+			writeRawModelsJson({
+				ollama: {
+					baseUrl: "http://localhost:11434/v1",
+					api: "openai-responses",
+					auth: "none",
+					models: [
+						{
+							id: "glm-5.1:cloud",
+							name: "GLM 5.1 Cloud (Ollama)",
+							reasoning: false,
+							input: ["text"],
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+							contextWindow: 202752,
+							maxTokens: 202752,
+							omitMaxOutputTokens: true,
+						},
+					],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const model = registry.find("ollama", "glm-5.1:cloud");
+			expect(model?.omitMaxOutputTokens).toBe(true);
+			expect(model?.maxTokens).toBe(202752);
+		});
 	});
 
 	describe("github-copilot oauth endpoint alignment", () => {
@@ -1454,7 +1557,7 @@ describe("ModelRegistry", () => {
 			]);
 
 			const requestedUrls: string[] = [];
-			using _hook = hookFetch((input: string | URL | Request, init?: RequestInit) => {
+			const fetchMock: FetchImpl = async (input, init) => {
 				const url = input instanceof Request ? input.url : String(input);
 				requestedUrls.push(url);
 				if (url === "https://copilot-api.ghe.example.com/models") {
@@ -1476,9 +1579,9 @@ describe("ModelRegistry", () => {
 					);
 				}
 				throw new Error(`Unexpected URL: ${url}`);
-			});
+			};
 
-			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 			await registry.refreshProvider("github-copilot", "online");
 			expect(requestedUrls).toContain("https://copilot-api.ghe.example.com/models");
 			expect(requestedUrls).not.toContain("https://api.githubcopilot.com/models");
@@ -1524,12 +1627,12 @@ describe("ModelRegistry", () => {
 				},
 			});
 			const requestedUrls: string[] = [];
-			using _hook = hookFetch(input => {
+			const fetchMock: FetchImpl = input => {
 				requestedUrls.push(String(input));
 				throw new Error(`Unexpected URL: ${String(input)}`);
-			});
+			};
 
-			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 			await registry.refresh("online");
 
 			const disabledProbeUrls = requestedUrls.filter(
@@ -1540,9 +1643,8 @@ describe("ModelRegistry", () => {
 	});
 	describe("runtime discovery", () => {
 		test("auto-discovers ollama models without provider config", async () => {
-			using _hook = mockOllamaDiscovery(["phi4-mini"]);
-
-			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const fetchMock = mockOllamaDiscovery(["phi4-mini"]);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 			await registry.refresh();
 			const ollamaModels = getModelsForProvider(registry, "ollama");
 			expect(ollamaModels.some(m => m.id === "phi4-mini")).toBe(true);
@@ -1550,10 +1652,59 @@ describe("ModelRegistry", () => {
 			expect(await registry.getApiKey(ollamaModels[0])).toBe(kNoAuth);
 		});
 
+		test("uses OLLAMA_HOST for implicit ollama discovery", async () => {
+			using _baseUrl = withEnv("OLLAMA_BASE_URL", undefined);
+			using _host = withEnv("OLLAMA_HOST", "ollama.lan:12345");
+			const fetchMock = mockOllamaDiscovery(["phi4-mini"], "http://ollama.lan:12345");
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+			await registry.refresh();
+
+			const model = registry.find("ollama", "phi4-mini");
+			expect(model?.baseUrl).toBe("http://ollama.lan:12345/v1");
+		});
+
+		test("keeps OLLAMA_BASE_URL precedence over OLLAMA_HOST", async () => {
+			using _baseUrl = withEnv("OLLAMA_BASE_URL", "http://omp-ollama.example:2222");
+			using _host = withEnv("OLLAMA_HOST", "ollama-host.example:3333");
+			const fetchMock = mockOllamaDiscovery(["phi4-mini"], "http://omp-ollama.example:2222");
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+			await registry.refresh();
+
+			const model = registry.find("ollama", "phi4-mini");
+			expect(model?.baseUrl).toBe("http://omp-ollama.example:2222/v1");
+		});
+
+		test("uses OLLAMA_CONTEXT_LENGTH for implicit ollama context accounting", async () => {
+			using _contextLength = withEnv("OLLAMA_CONTEXT_LENGTH", "16384");
+			const fetchMock = mockOllamaDiscovery(["phi4-mini"]);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+			await registry.refresh();
+
+			const model = registry.find("ollama", "phi4-mini");
+			expect(model?.contextWindow).toBe(16384);
+			expect(model?.maxTokens).toBe(16384);
+		});
+
+		test("lets OLLAMA_CONTEXT_LENGTH override ollama show metadata", async () => {
+			using _contextLength = withEnv("OLLAMA_CONTEXT_LENGTH", "32768");
+			const fetchMock = mockOllamaDiscovery(["phi4-mini"], "http://127.0.0.1:11434", {
+				model_info: {
+					"phi4.context_length": 4096,
+				},
+				capabilities: ["completion"],
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+			await registry.refresh();
+
+			const model = registry.find("ollama", "phi4-mini");
+			expect(model?.contextWindow).toBe(32768);
+			expect(model?.maxTokens).toBe(32768);
+		});
+
 		test("discovers ollama-cloud through built-in descriptor flow without regressing local implicit ollama", async () => {
 			authStorage.setRuntimeApiKey("ollama-cloud", "cloud-test-key");
 
-			using _hook = hookFetch((input, init) => {
+			const fetchMock: FetchImpl = async (input, init) => {
 				const url = String(input);
 				if (url === "http://127.0.0.1:11434/api/tags") {
 					return new Response(JSON.stringify({ models: [{ name: "phi4-mini" }] }), {
@@ -1589,9 +1740,9 @@ describe("ModelRegistry", () => {
 					);
 				}
 				throw new Error(`Unexpected URL: ${url}`);
-			});
+			};
 
-			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 			await registry.refresh();
 
 			const local = registry.find("ollama", "phi4-mini");
@@ -1622,7 +1773,7 @@ describe("ModelRegistry", () => {
 				},
 			});
 
-			using _hook = hookFetch(input => {
+			const fetchMock: FetchImpl = async input => {
 				const url = String(input);
 				if (url === "http://127.0.0.1:11434/api/tags") {
 					return new Response(
@@ -1639,9 +1790,9 @@ describe("ModelRegistry", () => {
 					});
 				}
 				throw new Error(`Unexpected URL: ${url}`);
-			});
+			};
 
-			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 			await registry.refresh();
 
 			const ollamaModels = getModelsForProvider(registry, "ollama");
@@ -1695,7 +1846,7 @@ describe("ModelRegistry", () => {
 				},
 			});
 
-			using _hook = hookFetch((input, init) => {
+			const fetchMock: FetchImpl = async (input, init) => {
 				const url = String(input);
 				if (url === "http://127.0.0.1:11434/api/tags") {
 					return new Response(
@@ -1721,9 +1872,9 @@ describe("ModelRegistry", () => {
 					}
 				}
 				throw new Error(`Unexpected request: ${url}`);
-			});
+			};
 
-			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 			await registry.refresh();
 
 			const qwen = registry.find("ollama", "qwen3.5:397b-cloud");
@@ -1739,7 +1890,7 @@ describe("ModelRegistry", () => {
 		});
 
 		test("discovers ollama context window from show model_info", async () => {
-			using _hook = hookFetch((input, init) => {
+			const fetchMock: FetchImpl = async (input, init) => {
 				const url = String(input);
 				if (url === "http://127.0.0.1:11434/api/tags") {
 					return new Response(JSON.stringify({ models: [{ name: "gemma3:4b" }] }), {
@@ -1764,14 +1915,14 @@ describe("ModelRegistry", () => {
 					}
 				}
 				throw new Error(`Unexpected request: ${url}`);
-			});
+			};
 
-			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 			await registry.refresh();
 
 			const gemma = registry.find("ollama", "gemma3:4b");
 			expect(gemma?.contextWindow).toBe(131072);
-			expect(gemma?.maxTokens).toBe(8192);
+			expect(gemma?.maxTokens).toBe(32_768);
 			expect(gemma?.input).toEqual(["text"]);
 			expect(gemma?.reasoning).toBe(false);
 		});
@@ -1786,11 +1937,11 @@ describe("ModelRegistry", () => {
 				},
 			});
 
-			using _hook = hookFetch(() => {
+			const fetchMock: FetchImpl = () => {
 				throw new Error("connection refused");
-			});
+			};
 
-			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 			await registry.refresh();
 			expect(getModelsForProvider(registry, "ollama")).toHaveLength(0);
 			expect(registry.getError()).toBeUndefined();
@@ -1806,21 +1957,19 @@ describe("ModelRegistry", () => {
 			});
 
 			{
-				using _hook = mockOllamaDiscovery(["phi4-mini"]);
-				const primedRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+				const fetchMock = mockOllamaDiscovery(["phi4-mini"]);
+				const primedRegistry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 				await primedRegistry.refresh();
 			}
 
-			const cachedRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+			const failingFetch: FetchImpl = () => {
+				throw new Error("connection refused");
+			};
+			const cachedRegistry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: failingFetch });
 			expect(getModelsForProvider(cachedRegistry, "ollama").some(model => model.id === "phi4-mini")).toBe(true);
 			expect(cachedRegistry.getProviderDiscoveryState("ollama")?.status).toBe("cached");
 
-			{
-				using _hook = hookFetch(() => {
-					throw new Error("connection refused");
-				});
-				await cachedRegistry.refreshProvider("ollama");
-			}
+			await cachedRegistry.refreshProvider("ollama");
 
 			expect(getModelsForProvider(cachedRegistry, "ollama").some(model => model.id === "phi4-mini")).toBe(true);
 			const state = cachedRegistry.getProviderDiscoveryState("ollama");
@@ -1839,7 +1988,7 @@ describe("ModelRegistry", () => {
 			authStorage.setRuntimeApiKey("custom-local", "test-key");
 
 			{
-				using _hook = hookFetch(input => {
+				const fetchMock: FetchImpl = async input => {
 					const url = String(input);
 					if (url === "http://127.0.0.1:11434/api/tags") {
 						return new Response(JSON.stringify({ models: [{ name: "local-coder" }] }), {
@@ -1854,8 +2003,8 @@ describe("ModelRegistry", () => {
 						});
 					}
 					throw new Error(`Unexpected URL: ${url}`);
-				});
-				const primedRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+				};
+				const primedRegistry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 				await primedRegistry.refreshProvider("custom-local");
 			}
 
@@ -1872,7 +2021,7 @@ describe("ModelRegistry", () => {
 		});
 		test("llama.cpp discovery honors configured API key", async () => {
 			authStorage.setRuntimeApiKey("llama.cpp", "test-llama-key");
-			using _hook = hookFetch((input, init) => {
+			const fetchMock: FetchImpl = async (input, init) => {
 				const url = String(input);
 				if (url === "http://127.0.0.1:8080/models") {
 					const headers = init?.headers as Headers | Record<string, string> | undefined;
@@ -1903,8 +2052,8 @@ describe("ModelRegistry", () => {
 					});
 				}
 				throw new Error(`Unexpected URL: ${url}`);
-			});
-			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			};
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 			await registry.refresh();
 			const llamaModels = getModelsForProvider(registry, "llama.cpp");
 			expect(llamaModels.some(m => m.id === "llama-3.2:3b")).toBe(true);
@@ -1913,7 +2062,7 @@ describe("ModelRegistry", () => {
 			expect(apiKey).not.toBe(kNoAuth);
 		});
 		test("llama.cpp discovery without API key is treated as keyless", async () => {
-			using _hook = hookFetch((input, init) => {
+			const fetchMock: FetchImpl = async (input, init) => {
 				const url = String(input);
 				if (url === "http://127.0.0.1:8080/models") {
 					const headers = init?.headers as Headers | Record<string, string> | undefined;
@@ -1945,8 +2094,8 @@ describe("ModelRegistry", () => {
 					});
 				}
 				throw new Error(`Unexpected URL: ${url}`);
-			});
-			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			};
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 			await registry.refresh();
 			const state = registry.getProviderDiscoveryState("llama.cpp");
 			if (state?.status !== "ok") {
@@ -1957,7 +2106,7 @@ describe("ModelRegistry", () => {
 			expect(apiKey).toBe(kNoAuth);
 		});
 		test("llama.cpp discovery reads context window from props n_ctx", async () => {
-			using _hook = hookFetch(input => {
+			const fetchMock: FetchImpl = async input => {
 				const url = String(input);
 				if (url === "http://127.0.0.1:8080/models") {
 					return new Response(JSON.stringify({ data: [{ id: "qwen35-35b-a3b" }] }), {
@@ -1983,12 +2132,12 @@ describe("ModelRegistry", () => {
 					);
 				}
 				throw new Error(`Unexpected URL: ${url}`);
-			});
-			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			};
+			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 			await registry.refresh();
 			const llama = registry.find("llama.cpp", "qwen35-35b-a3b");
 			expect(llama?.contextWindow).toBe(262144);
-			expect(llama?.maxTokens).toBe(8192);
+			expect(llama?.maxTokens).toBe(32_768);
 			expect(llama?.input).toEqual(["text", "image"]);
 		});
 	});
@@ -2268,6 +2417,56 @@ describe("ModelRegistry", () => {
 		expect(registry.find("ollama-cloud", "deepseek-v4-pro")?.maxTokens).toBe(384_000);
 	});
 
+	test("loads cached special provider discovery models on startup", () => {
+		const cachedModels: Model[] = [
+			{
+				id: "gemini-3.5-flash-low",
+				name: "Gemini 3.5 Flash Low",
+				api: "google-gemini-cli",
+				provider: "google-antigravity",
+				baseUrl: "https://cloudcode-pa.googleapis.com",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 1_000_000,
+				maxTokens: 8_192,
+			},
+			{
+				id: "gemini-3.5-flash",
+				name: "Gemini 3.5 Flash",
+				api: "google-gemini-cli",
+				provider: "google-gemini-cli",
+				baseUrl: "https://cloudcode-pa.googleapis.com",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 1_000_000,
+				maxTokens: 16_384,
+			},
+			{
+				id: "gpt-5.4-codex-pro",
+				name: "GPT-5.4 Codex Pro",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				baseUrl: "https://chatgpt.com/backend-api/codex",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 400_000,
+				maxTokens: 128_000,
+			},
+		];
+		for (const cachedModel of cachedModels) {
+			writeModelCache(cachedModel.provider, Date.now(), [cachedModel], true, "", cacheDbPath);
+		}
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+		expect(registry.find("google-antigravity", "gemini-3.5-flash-low")?.maxTokens).toBe(8_192);
+		expect(registry.find("google-gemini-cli", "gemini-3.5-flash")?.maxTokens).toBe(16_384);
+		expect(registry.find("openai-codex", "gpt-5.4-codex-pro")?.maxTokens).toBe(128_000);
+	});
+
 	test("replaces bundled google-vertex models with authoritative Vertex project discovery", () => {
 		const cachedModel: Model<"openai-completions"> = {
 			id: "zai-org/glm-4.7-maas",
@@ -2314,8 +2513,10 @@ describe("ModelRegistry", () => {
 
 	test("does not re-add bundled synthetic models after authoritative refresh", async () => {
 		authStorage.setRuntimeApiKey("synthetic", "synthetic-test-key");
-		using _hook = mockOpenAiCompatibleModels("https://api.synthetic.new/openai/v1/models", ["hf:zai-org/GLM-5.1"]);
-		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		const fetchMock = mockOpenAiCompatibleModels("https://api.synthetic.new/openai/v1/models", [
+			"hf:zai-org/GLM-5.1",
+		]);
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 
 		await registry.refresh("online");
 		const syntheticModels = getModelsForProvider(registry, "synthetic");

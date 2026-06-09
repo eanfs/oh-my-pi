@@ -7,15 +7,17 @@ import type { Settings } from "../config/settings";
 import type {
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
+	ExtensionUISelectItem,
 	ExtensionWidgetContent,
 	ExtensionWidgetOptions,
 } from "../extensibility/extensions";
 import type { CompactOptions } from "../extensibility/extensions/types";
 import type { MCPManager } from "../mcp";
 import type { PlanApprovalDetails } from "../plan-mode/approved-plan";
-import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
+import type { AgentSession } from "../session/agent-session";
 import type { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
+import type { ShakeMode } from "../session/shake-types";
 import type { LspStartupServerInfo } from "../tools";
 import type { AssistantMessageComponent } from "./components/assistant-message";
 import type { BashExecutionComponent } from "./components/bash-execution";
@@ -23,7 +25,7 @@ import type { CustomEditor } from "./components/custom-editor";
 import type { EvalExecutionComponent } from "./components/eval-execution";
 import type { HookEditorComponent } from "./components/hook-editor";
 import type { HookInputComponent } from "./components/hook-input";
-import type { HookSelectorComponent } from "./components/hook-selector";
+import type { HookSelectorComponent, HookSelectorOptions } from "./components/hook-selector";
 import type { StatusLineComponent } from "./components/status-line";
 import type { ToolExecutionHandle } from "./components/tool-execution";
 import type { LoopLimitRuntime } from "./loop-limit";
@@ -33,12 +35,18 @@ import type { Theme } from "./theme/theme";
 export type CompactionQueuedMessage = {
 	text: string;
 	mode: "steer" | "followUp";
+	images?: ImageContent[];
 };
 
 export type SubmittedUserInput = {
 	text: string;
 	images?: ImageContent[];
+	imageLinks?: (string | undefined)[];
 	customType?: string;
+	/** Route through `session.prompt(text, { synthetic: true })` so the text lands
+	 *  as a hidden agent-authored `developer` message rather than a visible user
+	 *  turn. Used by the `c`/`.` continue shortcut. */
+	synthetic?: boolean;
 	display?: boolean;
 	cancelled: boolean;
 	started: boolean;
@@ -60,7 +68,10 @@ export type TodoPhase = {
 
 export interface InteractiveModeInitOptions {
 	suppressWelcomeIntro?: boolean;
+	clearInitialTerminalHistory?: boolean;
 }
+
+export type InteractiveSelectorDialogOptions = ExtensionUIDialogOptions & Pick<HookSelectorOptions, "disabledIndices">;
 
 export interface InteractiveModeContext {
 	// UI access
@@ -71,6 +82,7 @@ export interface InteractiveModeContext {
 	todoContainer: Container;
 	btwContainer: Container;
 	omfgContainer: Container;
+	errorBannerContainer: Container;
 	editor: CustomEditor;
 	editorContainer: Container;
 	hookWidgetContainerAbove: Container;
@@ -89,7 +101,6 @@ export interface InteractiveModeContext {
 
 	// State
 	isInitialized: boolean;
-	isBackgrounded: boolean;
 	isBashMode: boolean;
 	toolOutputExpanded: boolean;
 	todoExpanded: boolean;
@@ -102,6 +113,7 @@ export interface InteractiveModeContext {
 	planModePlanFilePath?: string;
 	hideThinkingBlock: boolean;
 	pendingImages: ImageContent[];
+	pendingImageLinks: (string | undefined)[];
 	compactionQueuedMessages: CompactionQueuedMessage[];
 	pendingTools: Map<string, ToolExecutionHandle>;
 	pendingBashComponents: BashExecutionComponent[];
@@ -142,31 +154,47 @@ export interface InteractiveModeContext {
 	// Extension UI integration
 	setToolUIContext(uiContext: ExtensionUIContext, hasUI: boolean): void;
 	initializeHookRunner(uiContext: ExtensionUIContext, hasUI: boolean): void;
-	createBackgroundUiContext(): ExtensionUIContext;
 	setEditorComponent(
 		factory: ((tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) => CustomEditor) | undefined,
 	): void;
 
-	// Event handling
-	handleBackgroundEvent(event: AgentSessionEvent): Promise<void>;
-
 	// UI helpers
+	/**
+	 * Mount transcript content and repaint once. The single sink for "show this in
+	 * chat": producers build and return a `Component` (or a `ChatBlock` carrying
+	 * its own lifecycle) and hand it here instead of touching `chatContainer` /
+	 * `ui.requestRender()` directly. `ChatBlock`s are mounted (their `onMount`
+	 * runs) so their timers/subscriptions start.
+	 */
+	present(content: Component | readonly Component[]): void;
+	/**
+	 * Dispose every live block in the transcript (stopping timers/subscriptions)
+	 * and clear it. Used before a full rebuild so animated/streaming blocks do not
+	 * leak.
+	 */
+	resetTranscript(): void;
 	showStatus(message: string, options?: { dim?: boolean }): void;
 	showError(message: string): void;
+	showPinnedError(message: string): void;
+	clearPinnedError(): void;
 	showWarning(message: string): void;
 	showNewVersionNotification(newVersion: string): void;
 	clearEditor(): void;
 	updatePendingMessagesDisplay(): void;
-	queueCompactionMessage(text: string, mode: "steer" | "followUp"): void;
+	queueCompactionMessage(text: string, mode: "steer" | "followUp", images?: ImageContent[]): void;
 	flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void>;
 	flushPendingBashComponents(): void;
 	flushPendingModelSwitch(): Promise<void>;
 	setWorkingMessage(message?: string): void;
 	applyPendingWorkingMessage(): void;
+	/** Acknowledge a user interrupt (Esc) by switching the loader to an
+	 *  "Interrupting…" label until the agent turn unwinds. */
+	notifyInterrupting(): void;
 	ensureLoadingAnimation(): void;
 	startPendingSubmission(input: {
 		text: string;
 		images?: ImageContent[];
+		imageLinks?: (string | undefined)[];
 		customType?: string;
 		display?: boolean;
 	}): SubmittedUserInput;
@@ -187,7 +215,10 @@ export interface InteractiveModeContext {
 	 */
 	withLocalSubmission<T>(text: string, fn: () => Promise<T>, options?: { imageCount?: number }): Promise<T>;
 	isKnownSlashCommand(text: string): boolean;
-	addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): Component[];
+	addMessageToChat(
+		message: AgentMessage,
+		options?: { populateHistory?: boolean; imageLinks?: readonly (string | undefined)[] },
+	): Component[];
 	renderSessionContext(
 		sessionContext: SessionContext,
 		options?: { updateFooter?: boolean; populateHistory?: boolean },
@@ -209,7 +240,6 @@ export interface InteractiveModeContext {
 	// Command handling
 	handleExportCommand(text: string): Promise<void>;
 	handleShareCommand(): Promise<void>;
-	handleCopyCommand(sub?: string): void;
 	handleTodoCommand(args: string): Promise<void>;
 	handleSessionCommand(): Promise<void>;
 	handleJobsCommand(): Promise<void>;
@@ -221,6 +251,7 @@ export interface InteractiveModeContext {
 	handleDumpCommand(): void;
 	handleDebugTranscriptCommand(): Promise<void>;
 	handleClearCommand(): Promise<void>;
+	handleFreshCommand(): Promise<void>;
 	handleDropCommand(): Promise<void>;
 	handleForkCommand(): Promise<void>;
 	handleBashCommand(command: string, excludeFromContext?: boolean): Promise<void>;
@@ -229,6 +260,7 @@ export interface InteractiveModeContext {
 	handleSSHCommand(text: string): Promise<void>;
 	handleCompactCommand(customInstructions?: string): Promise<CompactionOutcome>;
 	handleHandoffCommand(customInstructions?: string): Promise<void>;
+	handleShakeCommand(mode: ShakeMode): Promise<void>;
 	handleMoveCommand(targetPath: string): Promise<void>;
 	handleRenameCommand(title: string): Promise<void>;
 	handleMemoryCommand(text: string): Promise<void>;
@@ -239,6 +271,7 @@ export interface InteractiveModeContext {
 	): Promise<CompactionOutcome>;
 	openInBrowser(urlOrPath: string): void;
 	refreshSlashCommandState(cwd?: string): Promise<void>;
+	applyCwdChange(newCwd: string): Promise<void>;
 
 	// Selector handling
 	showSettingsSelector(): void;
@@ -248,13 +281,14 @@ export interface InteractiveModeContext {
 	showModelSelector(options?: { temporaryOnly?: boolean }): void;
 	showPluginSelector(mode?: "install" | "uninstall"): void;
 	showUserMessageSelector(): void;
+	showCopySelector(): void;
 	showTreeSelector(): void;
 	showSessionSelector(): void;
 	handleResumeSession(sessionPath: string): Promise<void>;
 	handleSessionDeleteCommand(): Promise<void>;
 	showOAuthSelector(mode: "login" | "logout", providerId?: string): Promise<void>;
 	showHookConfirm(title: string, message: string): Promise<boolean>;
-	showDebugSelector(): void;
+	showDebugSelector(): Promise<void>;
 	showSessionObserver(): void;
 	resetObserverRegistry(): void;
 
@@ -263,16 +297,16 @@ export interface InteractiveModeContext {
 	handleCtrlD(): void;
 	handleCtrlZ(): void;
 	handleDequeue(): void;
-	handleBackgroundCommand(): void;
 	handleImagePaste(): Promise<boolean>;
 	handleBtwCommand(question: string): Promise<void>;
+	handleTanCommand(work: string): Promise<void>;
 	hasActiveBtw(): boolean;
 	handleBtwEscape(): boolean;
 	handleOmfgCommand(complaint: string): Promise<void>;
 	hasActiveOmfg(): boolean;
 	handleOmfgEscape(): boolean;
 	cycleThinkingLevel(): void;
-	cycleRoleModel(options?: { temporary?: boolean }): Promise<void>;
+	cycleRoleModel(direction?: "forward" | "backward"): Promise<void>;
 	toggleToolOutputExpansion(): void;
 	setToolsExpanded(expanded: boolean): void;
 	toggleThinkingBlockVisibility(): void;
@@ -284,6 +318,7 @@ export interface InteractiveModeContext {
 	disableLoopMode(): void;
 	pauseLoop(): void;
 	handlePlanApproval(details: PlanApprovalDetails): Promise<void>;
+	openPlanReview(): Promise<void>;
 
 	// Hook UI methods
 	initHooksAndCustomTools(): Promise<void>;
@@ -295,8 +330,8 @@ export interface InteractiveModeContext {
 	setHookStatus(key: string, text: string | undefined): void;
 	showHookSelector(
 		title: string,
-		options: string[],
-		dialogOptions?: ExtensionUIDialogOptions,
+		options: ExtensionUISelectItem[],
+		dialogOptions?: InteractiveSelectorDialogOptions,
 	): Promise<string | undefined>;
 	hideHookSelector(): void;
 	showHookInput(title: string, placeholder?: string): Promise<string | undefined>;

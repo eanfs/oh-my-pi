@@ -1,5 +1,10 @@
 import type { ToolSession } from "../../tools";
-import type { ExecutorBackend, ExecutorBackendExecOptions, ExecutorBackendResult } from "../backend";
+import {
+	type ExecutorBackend,
+	type ExecutorBackendExecOptions,
+	type ExecutorBackendResult,
+	resolveEvalUrlRoots,
+} from "../backend";
 import { executeJs } from "./executor";
 
 const JS_SESSION_PREFIX = "js:";
@@ -20,7 +25,7 @@ export default {
 	async execute(code: string, opts: ExecutorBackendExecOptions): Promise<ExecutorBackendResult> {
 		const result = await executeJs(code, {
 			cwd: opts.cwd,
-			deadlineMs: opts.deadlineMs,
+			idleTimeoutMs: opts.idleTimeoutMs,
 			signal: opts.signal,
 			sessionId: namespaceSessionId(opts.sessionId),
 			sessionFile: opts.sessionFile,
@@ -28,7 +33,9 @@ export default {
 			artifactPath: opts.artifactPath,
 			artifactId: opts.artifactId,
 			onChunk: opts.onChunk,
+			onStatus: opts.onStatus,
 			session: opts.session,
+			localRoots: resolveEvalUrlRoots(opts.session),
 		});
 		return {
 			output: result.output,

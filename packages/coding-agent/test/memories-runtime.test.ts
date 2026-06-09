@@ -46,6 +46,7 @@ function createModelRegistry(model: Model): any {
 		find: vi.fn(() => model),
 		getAll: vi.fn(() => [model]),
 		getApiKey: vi.fn(async () => "test-api-key"),
+		resolver: vi.fn(() => async () => "test-api-key"),
 	};
 }
 
@@ -221,9 +222,8 @@ describe("memories runtime", () => {
 			expect(
 				(await fs.readFile(path.join(memoryRoot, "skills", "deploy-playbook", "SKILL.md"), "utf8")).trim(),
 			).toBe("# Deploy\nUse blue/green.");
+			expect(fx.session.refreshBaseSystemPrompt).toHaveBeenCalledTimes(1);
 		});
-
-		expect(fx.session.refreshBaseSystemPrompt).toHaveBeenCalledTimes(1);
 		expect(ai.completeSimple).toHaveBeenCalled();
 		expect(ai.completeSimple).toHaveBeenCalledTimes(2);
 	});

@@ -4,11 +4,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Agent, type AgentTool, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { Effort, type Model } from "@oh-my-pi/pi-ai";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { CustomTool } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools/types";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import * as z from "zod/v4";
-import { Settings } from "../src/config/settings";
-import type { CustomTool } from "../src/extensibility/custom-tools/types";
-import { AgentSession } from "../src/session/agent-session";
-import { SessionManager } from "../src/session/session-manager";
 
 function createModel(): Model<"openai-responses"> {
 	return {
@@ -226,6 +226,51 @@ describe("AgentSession MCP discovery", () => {
 		expect(session.getSelectedMCPToolNames()).toEqual([]);
 		expect(session.getActiveToolNames()).toEqual(["read"]);
 		expect(session.systemPrompt).toEqual(["tools:read"]);
+	});
+
+	it("activates all new MCP tools when activateAll is true, even with discovery off", async () => {
+		const readTool = createBasicTool("read", "Read");
+		const toolRegistry = new Map([[readTool.name, readTool]]);
+		const agent = new Agent({
+			initialState: {
+				model: createModel(),
+				systemPrompt: ["initial"],
+				tools: [readTool],
+				messages: [],
+			},
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "mcp.discoveryMode": false }),
+			modelRegistry: {} as never,
+			toolRegistry,
+			mcpDiscoveryEnabled: false,
+			rebuildSystemPrompt: async toolNames => ({
+				systemPrompt: [`tools:${toolNames.join(",")}`],
+			}),
+		});
+		sessions.push(session);
+
+		// Start with only non-MCP tools active — no MCP tools in registry.
+		expect(session.getActiveToolNames()).toEqual(["read"]);
+		expect(session.getSelectedMCPToolNames()).toEqual([]);
+
+		// Load MCP tools via activateAll path (simulating ACP client provisioning).
+		await session.refreshMCPTools(
+			[
+				createMcpCustomTool("mcp__docs_search", "docs", "search", "Search internal docs", ["query"]),
+				createMcpCustomTool("mcp__slack_send_message", "slack", "send_message", "Send a Slack message", [
+					"channel",
+					"text",
+				]),
+			],
+			{ activateAll: true },
+		);
+
+		expect(session.getSelectedMCPToolNames()).toEqual(["mcp__docs_search", "mcp__slack_send_message"]);
+		expect(session.getActiveToolNames()).toEqual(["read", "mcp__docs_search", "mcp__slack_send_message"]);
+		expect(session.systemPrompt).toEqual(["tools:read,mcp__docs_search,mcp__slack_send_message"]);
 	});
 
 	it("preserves directly activated MCP tools across refreshes in discovery mode", async () => {

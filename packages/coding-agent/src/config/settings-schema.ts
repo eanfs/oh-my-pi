@@ -23,6 +23,7 @@ import {
 	TINY_TITLE_MODEL_VALUES,
 } from "../tiny/models";
 import { EDIT_MODES } from "../utils/edit-mode";
+import { SEARCH_PROVIDER_OPTIONS, SEARCH_PROVIDER_PREFERENCES } from "../web/search/types";
 
 /** Unified settings schema - single source of truth for all settings.
  * Unified settings schema - single source of truth for all settings.
@@ -608,6 +609,24 @@ export const SETTINGS_SCHEMA = {
 			"Maximum height in terminal rows for inline images (default 20). Set to 0 to use only the viewport-based limit (60% of terminal height).",
 	},
 
+	"tui.maxInlineImages": {
+		type: "number",
+		default: 8,
+		description:
+			"Maximum number of inline images kept as live terminal graphics (default 8). Older images fall back to a text placeholder via a full redraw once the limit is exceeded. Set to 0 to keep every image (no limit).",
+	},
+
+	"tui.textSizing": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "appearance",
+			label: "Large Headings (Kitty)",
+			description:
+				"Render Markdown H1 headings at 2x scale using Kitty's OSC 66 text-sizing protocol. Only takes effect on Kitty terminals; ignored everywhere else. Off by default.",
+		},
+	},
+
 	"tui.hyperlinks": {
 		type: "enum",
 		values: ["off", "auto", "always"] as const,
@@ -616,7 +635,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "appearance",
 			label: "Terminal Hyperlinks",
 			description:
-				"Wrap file paths in OSC 8 hyperlinks for terminal-native click-to-open (auto: detect support; off: never; always: unconditional)",
+				"Wrap paths and URLs in OSC 8 hyperlinks for terminal-native click-to-open (auto: detect support; off: never; always: unconditional)",
 		},
 	},
 	// Display rendering
@@ -638,6 +657,16 @@ export const SETTINGS_SCHEMA = {
 				{ value: "kitt", label: "KITT Scanner", description: "Knight Rider 1982 red light bouncing left-right" },
 				{ value: "disabled", label: "Disabled", description: "No animation; static muted text" },
 			],
+		},
+	},
+
+	"display.smoothStreaming": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "appearance",
+			label: "Smooth Streaming",
+			description: "Reveal assistant text smoothly while streamed chunks arrive",
 		},
 	},
 
@@ -700,6 +729,16 @@ export const SETTINGS_SCHEMA = {
 			tab: "model",
 			label: "Repeat Tool Descriptions",
 			description: "Render full tool descriptions in the system prompt instead of a tool name list",
+		},
+	},
+
+	includeModelInPrompt: {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "model",
+			label: "Include Model In Prompt",
+			description: "Surface the active model identifier in the system prompt so the agent knows which model it is",
 		},
 	},
 
@@ -871,6 +910,15 @@ export const SETTINGS_SCHEMA = {
 			label: "Max Retry Delay",
 			description:
 				"Maximum wait between retries, in ms. When the provider asks us to wait longer than this and no credential or model fallback succeeds, the request fails fast instead of sleeping (e.g. 3-hour Anthropic rate-limit windows).",
+		},
+	},
+	"retry.modelFallback": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "model",
+			label: "Retry Model Fallback",
+			description: "Allow retry recovery to switch to configured fallback models",
 		},
 	},
 	"retry.fallbackChains": { type: "record", default: {} as Record<string, string[]> },
@@ -1136,12 +1184,13 @@ export const SETTINGS_SCHEMA = {
 
 	"compaction.strategy": {
 		type: "enum",
-		values: ["context-full", "handoff", "off"] as const,
+		values: ["context-full", "handoff", "shake", "off"] as const,
 		default: "context-full",
 		ui: {
 			tab: "context",
 			label: "Compaction Strategy",
-			description: "Choose in-place context-full maintenance, auto-handoff, or disable auto maintenance (off)",
+			description:
+				"Choose in-place context-full maintenance, auto-handoff, surgical shake (drop heavy content), or disable auto maintenance (off)",
 			options: [
 				{
 					value: "context-full",
@@ -1149,6 +1198,11 @@ export const SETTINGS_SCHEMA = {
 					description: "Summarize in-place and keep the current session",
 				},
 				{ value: "handoff", label: "Handoff", description: "Generate handoff and continue in a new session" },
+				{
+					value: "shake",
+					label: "Shake",
+					description: "Drop heavy content (tool results + large blocks) in place; recover via artifact",
+				},
 				{
 					value: "off",
 					label: "Off",
@@ -1327,70 +1381,70 @@ export const SETTINGS_SCHEMA = {
 	"memories.summaryInjectionTokenLimit": { type: "number", default: 5000 },
 
 	// Memory backend selector — picks between local memories pipeline,
-	// Mnemosyne local SQLite, Hindsight remote memory, or off. Legacy
+	// Mnemopi local SQLite, Hindsight remote memory, or off. Legacy
 	// `memories.enabled` keeps gating the local backend; see config/settings.ts
 	// migration for details.
 	"memory.backend": {
 		type: "enum",
-		values: ["off", "local", "hindsight", "mnemosyne"] as const,
+		values: ["off", "local", "hindsight", "mnemopi"] as const,
 		default: "off",
 		ui: {
 			tab: "memory",
 			label: "Memory Backend",
-			description: "Off, local summary pipeline, Mnemosyne SQLite, or Hindsight remote memory",
+			description: "Off, local summary pipeline, Mnemopi SQLite, or Hindsight remote memory",
 			options: [
 				{ value: "off", label: "Off", description: "No memory subsystem runs" },
 				{ value: "local", label: "Local", description: "Local rollout summarisation pipeline (memory_summary.md)" },
 				{ value: "hindsight", label: "Hindsight", description: "Vectorize Hindsight remote memory service" },
 				{
-					value: "mnemosyne",
-					label: "Mnemosyne",
+					value: "mnemopi",
+					label: "Mnemopi",
 					description: "Local SQLite recall/retain backend with optional embeddings",
 				},
 			],
 		},
 	},
 
-	// Mnemosyne local SQLite memory backend.
-	"mnemosyne.dbPath": {
+	// Mnemopi local SQLite memory backend.
+	"mnemopi.dbPath": {
 		type: "string",
 		default: undefined,
 		ui: {
 			tab: "memory",
-			label: "Mnemosyne DB Path",
+			label: "Mnemopi DB Path",
 			description: "Optional SQLite DB path. Defaults to the agent memories directory.",
-			condition: "mnemosyneActive",
+			condition: "mnemopiActive",
 		},
 	},
-	"mnemosyne.bank": {
+	"mnemopi.bank": {
 		type: "string",
 		default: undefined,
 		ui: {
 			tab: "memory",
-			label: "Mnemosyne Bank",
+			label: "Mnemopi Bank",
 			description: "Optional shared bank base name. Per-project modes derive project-local banks from it.",
-			condition: "mnemosyneActive",
+			condition: "mnemopiActive",
 		},
 	},
-	"mnemosyne.scoping": {
+	"mnemopi.scoping": {
 		type: "enum",
 		values: ["global", "per-project", "per-project-tagged"] as const,
 		default: "per-project",
 		ui: {
 			tab: "memory",
-			label: "Mnemosyne Scoping",
+			label: "Mnemopi Scoping",
 			description:
 				"global = one shared bank; per-project = isolated bank per cwd; per-project-tagged = project-local writes plus global recall visibility",
 			options: [
 				{
 					value: "global",
 					label: "Global",
-					description: "One shared Mnemosyne bank for every project",
+					description: "One shared Mnemopi bank for every project",
 				},
 				{
 					value: "per-project",
 					label: "Per project",
-					description: "Project-local Mnemosyne bank per cwd basename",
+					description: "Project-local Mnemopi bank per cwd basename",
 				},
 				{
 					value: "per-project-tagged",
@@ -1398,121 +1452,121 @@ export const SETTINGS_SCHEMA = {
 					description: "Write to a project-local bank but merge project + shared recall results",
 				},
 			],
-			condition: "mnemosyneActive",
+			condition: "mnemopiActive",
 		},
 	},
-	"mnemosyne.autoRecall": {
+	"mnemopi.autoRecall": {
 		type: "boolean",
 		default: true,
 		ui: {
 			tab: "memory",
-			label: "Mnemosyne Auto Recall",
+			label: "Mnemopi Auto Recall",
 			description: "Recall local memories into the first turn of each session",
-			condition: "mnemosyneActive",
+			condition: "mnemopiActive",
 		},
 	},
-	"mnemosyne.autoRetain": {
+	"mnemopi.autoRetain": {
 		type: "boolean",
 		default: true,
 		ui: {
 			tab: "memory",
-			label: "Mnemosyne Auto Retain",
-			description: "Retain completed conversation turns into local Mnemosyne memory",
-			condition: "mnemosyneActive",
+			label: "Mnemopi Auto Retain",
+			description: "Retain completed conversation turns into local Mnemopi memory",
+			condition: "mnemopiActive",
 		},
 	},
-	"mnemosyne.noEmbeddings": {
+	"mnemopi.noEmbeddings": {
 		type: "boolean",
 		default: false,
 		ui: {
 			tab: "memory",
-			label: "Mnemosyne Disable Embeddings",
+			label: "Mnemopi Disable Embeddings",
 			description: "Force deterministic FTS-only recall instead of vector embeddings",
-			condition: "mnemosyneActive",
+			condition: "mnemopiActive",
 		},
 	},
-	"mnemosyne.embeddingModel": {
+	"mnemopi.embeddingModel": {
 		type: "string",
 		default: undefined,
 		ui: {
 			tab: "memory",
-			label: "Mnemosyne Embedding Model",
-			description: "Optional embedding model override passed to Mnemosyne",
-			condition: "mnemosyneActive",
+			label: "Mnemopi Embedding Model",
+			description: "Optional embedding model override passed to Mnemopi",
+			condition: "mnemopiActive",
 		},
 	},
-	"mnemosyne.embeddingApiUrl": {
+	"mnemopi.embeddingApiUrl": {
 		type: "string",
 		default: undefined,
 		ui: {
 			tab: "memory",
-			label: "Mnemosyne Embedding API URL",
-			description: "Optional OpenAI-compatible embedding endpoint passed to Mnemosyne",
-			condition: "mnemosyneActive",
+			label: "Mnemopi Embedding API URL",
+			description: "Optional OpenAI-compatible embedding endpoint passed to Mnemopi",
+			condition: "mnemopiActive",
 		},
 	},
-	"mnemosyne.embeddingApiKey": {
+	"mnemopi.embeddingApiKey": {
 		type: "string",
 		default: undefined,
 		ui: {
 			tab: "memory",
-			label: "Mnemosyne Embedding API Key",
-			description: "Optional embedding API key passed to Mnemosyne",
-			condition: "mnemosyneActive",
+			label: "Mnemopi Embedding API Key",
+			description: "Optional embedding API key passed to Mnemopi",
+			condition: "mnemopiActive",
 		},
 	},
-	"mnemosyne.llmMode": {
+	"mnemopi.llmMode": {
 		type: "enum",
 		values: ["none", "smol", "remote"] as const,
 		default: "smol",
 		ui: {
 			tab: "memory",
-			label: "Mnemosyne LLM Mode",
+			label: "Mnemopi LLM Mode",
 			description: "Use no LLM, the configured smol model, or a remote OpenAI-compatible endpoint",
-			condition: "mnemosyneActive",
+			condition: "mnemopiActive",
 			options: [
-				{ value: "none", label: "None", description: "Disable Mnemosyne LLM-backed extraction" },
+				{ value: "none", label: "None", description: "Disable Mnemopi LLM-backed extraction" },
 				{ value: "smol", label: "Smol", description: "Use the configured pi-ai smol model" },
-				{ value: "remote", label: "Remote", description: "Use the Mnemosyne remote LLM settings below" },
+				{ value: "remote", label: "Remote", description: "Use the Mnemopi remote LLM settings below" },
 			],
 		},
 	},
-	"mnemosyne.llmBaseUrl": {
+	"mnemopi.llmBaseUrl": {
 		type: "string",
 		default: undefined,
 		ui: {
 			tab: "memory",
-			label: "Mnemosyne LLM Base URL",
-			description: "Optional OpenAI-compatible LLM endpoint for Mnemosyne remote mode",
-			condition: "mnemosyneActive",
+			label: "Mnemopi LLM Base URL",
+			description: "Optional OpenAI-compatible LLM endpoint for Mnemopi remote mode",
+			condition: "mnemopiActive",
 		},
 	},
-	"mnemosyne.llmApiKey": {
+	"mnemopi.llmApiKey": {
 		type: "string",
 		default: undefined,
 		ui: {
 			tab: "memory",
-			label: "Mnemosyne LLM API Key",
-			description: "Optional LLM API key for Mnemosyne remote mode",
-			condition: "mnemosyneActive",
+			label: "Mnemopi LLM API Key",
+			description: "Optional LLM API key for Mnemopi remote mode",
+			condition: "mnemopiActive",
 		},
 	},
-	"mnemosyne.llmModel": {
+	"mnemopi.llmModel": {
 		type: "string",
 		default: undefined,
 		ui: {
 			tab: "memory",
-			label: "Mnemosyne LLM Model",
-			description: "Optional LLM model name for Mnemosyne remote mode",
-			condition: "mnemosyneActive",
+			label: "Mnemopi LLM Model",
+			description: "Optional LLM model name for Mnemopi remote mode",
+			condition: "mnemopiActive",
 		},
 	},
-	"mnemosyne.retainEveryNTurns": { type: "number", default: 4 },
-	"mnemosyne.recallLimit": { type: "number", default: 8 },
-	"mnemosyne.recallContextTurns": { type: "number", default: 3 },
-	"mnemosyne.recallMaxQueryChars": { type: "number", default: 4000 },
-	"mnemosyne.injectionTokenLimit": { type: "number", default: 5000 },
-	"mnemosyne.debug": { type: "boolean", default: false },
+	"mnemopi.retainEveryNTurns": { type: "number", default: 4 },
+	"mnemopi.recallLimit": { type: "number", default: 8 },
+	"mnemopi.recallContextTurns": { type: "number", default: 3 },
+	"mnemopi.recallMaxQueryChars": { type: "number", default: 4000 },
+	"mnemopi.injectionTokenLimit": { type: "number", default: 5000 },
+	"mnemopi.debug": { type: "boolean", default: false },
 
 	// Hindsight (https://hindsight.vectorize.io)
 	"hindsight.apiUrl": {
@@ -1820,7 +1874,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "editing",
 			label: "Hash Lines",
 			description:
-				"Include snapshot-tag headers and line numbers in read output for hashline edit mode (¶PATH#tag plus LINE:content)",
+				"Include snapshot-tag headers and line numbers in read output for hashline edit mode ([PATH#TAG] plus LINE:content)",
 		},
 	},
 
@@ -1960,6 +2014,16 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"lsp.diagnosticsDeduplicate": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "editing",
+			label: "Deduplicate Diagnostics",
+			description: "Suppress post-edit LSP diagnostics already shown for a file; only surface new or changed ones",
+		},
+	},
+
 	// Bash interceptor
 	"bashInterceptor.enabled": {
 		type: "boolean",
@@ -2088,7 +2152,7 @@ export const SETTINGS_SCHEMA = {
 	"todo.enabled": {
 		type: "boolean",
 		default: true,
-		ui: { tab: "tools", label: "Todos", description: "Enable the todo_write tool for task tracking" },
+		ui: { tab: "tools", label: "Todos", description: "Enable the todo tool for task tracking" },
 	},
 
 	"todo.reminders": {
@@ -2121,6 +2185,12 @@ export const SETTINGS_SCHEMA = {
 			label: "Create Todos Automatically",
 			description: "Automatically create a comprehensive todo list after the first message",
 		},
+	},
+
+	"bash.enabled": {
+		type: "boolean",
+		default: true,
+		ui: { tab: "tools", label: "Bash", description: "Enable the bash tool for shell command execution" },
 	},
 
 	// Search and AST tools
@@ -2448,13 +2518,13 @@ export const SETTINGS_SCHEMA = {
 	// Tool Discovery
 	"tools.discoveryMode": {
 		type: "enum",
-		values: ["off", "mcp-only", "all"] as const,
-		default: "off",
+		values: ["auto", "off", "mcp-only", "all"] as const,
+		default: "auto",
 		ui: {
 			tab: "tools",
 			label: "Tool Discovery",
 			description:
-				"Hide tools behind a search tool to save tokens. 'mcp-only' hides MCP tools; 'all' hides all non-essential built-ins too.",
+				"Hide tools behind a search tool to save tokens. 'auto' hides MCP tools once the tool set has more than 40 tools; 'mcp-only' always hides MCP tools; 'all' hides all non-essential built-ins too.",
 		},
 	},
 
@@ -2850,65 +2920,13 @@ export const SETTINGS_SCHEMA = {
 	// Provider selection
 	"providers.webSearch": {
 		type: "enum",
-		values: [
-			"auto",
-			"exa",
-			"brave",
-			"jina",
-			"kimi",
-			"zai",
-			"perplexity",
-			"anthropic",
-			"gemini",
-			"codex",
-			"tavily",
-			"kagi",
-			"synthetic",
-			"parallel",
-			"searxng",
-		] as const,
+		values: SEARCH_PROVIDER_PREFERENCES,
 		default: "auto",
 		ui: {
 			tab: "providers",
 			label: "Web Search Provider",
 			description: "Provider for web search tool",
-			options: [
-				{
-					value: "auto",
-					label: "Auto",
-					description: "Preferred web-search provider",
-				},
-				{ value: "exa", label: "Exa", description: "Uses Exa API when EXA_API_KEY is set; falls back to Exa MCP" },
-				{ value: "brave", label: "Brave", description: "Requires BRAVE_API_KEY" },
-				{ value: "jina", label: "Jina", description: "Requires JINA_API_KEY" },
-				{ value: "kimi", label: "Kimi", description: "Requires MOONSHOT_SEARCH_API_KEY or MOONSHOT_API_KEY" },
-				{
-					value: "perplexity",
-					label: "Perplexity",
-					description: "Requires PERPLEXITY_COOKIES or PERPLEXITY_API_KEY",
-				},
-				{
-					value: "anthropic",
-					label: "Anthropic",
-					description: "Claude's native web_search tool (uses Anthropic OAuth or ANTHROPIC_API_KEY)",
-				},
-				{
-					value: "codex",
-					label: "OpenAI",
-					description: "OpenAI's native web_search (uses ChatGPT OAuth via /login openai-codex)",
-				},
-				{
-					value: "gemini",
-					label: "Gemini",
-					description: "Google Search grounding via Gemini (uses google-gemini-cli or google-antigravity OAuth)",
-				},
-				{ value: "zai", label: "Z.AI", description: "Calls Z.AI webSearchPrime MCP" },
-				{ value: "tavily", label: "Tavily", description: "Requires TAVILY_API_KEY" },
-				{ value: "kagi", label: "Kagi", description: "Requires KAGI_API_KEY and Kagi Search API beta access" },
-				{ value: "synthetic", label: "Synthetic", description: "Requires SYNTHETIC_API_KEY" },
-				{ value: "parallel", label: "Parallel", description: "Requires PARALLEL_API_KEY" },
-				{ value: "searxng", label: "SearXNG", description: "Requires SEARXNG_ENDPOINT or searxng.endpoint" },
-			],
+			options: SEARCH_PROVIDER_OPTIONS,
 		},
 	},
 	"providers.image": {
@@ -2984,8 +3002,8 @@ export const SETTINGS_SCHEMA = {
 			tab: "memory",
 			label: "Memory Model",
 			description:
-				"Mnemosyne LLM for fact extraction + consolidation: online (smol/remote) by default, or a local on-device model",
-			condition: "mnemosyneActive",
+				"Mnemopi LLM for fact extraction + consolidation: online (smol/remote) by default, or a local on-device model",
+			condition: "mnemopiActive",
 			options: TINY_MEMORY_MODEL_OPTIONS,
 		},
 	},
@@ -3057,13 +3075,26 @@ export const SETTINGS_SCHEMA = {
 			],
 		},
 	},
-	"providers.parallelFetch": {
-		type: "boolean",
-		default: true,
+	"providers.fetch": {
+		type: "enum",
+		values: ["auto", "native", "trafilatura", "lynx", "parallel", "jina"] as const,
+		default: "auto",
 		ui: {
 			tab: "providers",
-			label: "Parallel Fetch",
-			description: "Use Parallel extract API for URL fetching when credentials are available",
+			label: "Fetch Provider",
+			description: "Reader backend priority for the fetch/read URL tool",
+			options: [
+				{
+					value: "auto",
+					label: "Auto",
+					description: "Priority: native > trafilatura > lynx > parallel > jina",
+				},
+				{ value: "native", label: "Native", description: "In-process HTML→Markdown converter (always available)" },
+				{ value: "trafilatura", label: "Trafilatura", description: "Auto-installs via uv/pip" },
+				{ value: "lynx", label: "Lynx", description: "Requires lynx system package" },
+				{ value: "parallel", label: "Parallel", description: "Requires PARALLEL_API_KEY" },
+				{ value: "jina", label: "Jina", description: "Uses r.jina.ai reader (JINA_API_KEY optional)" },
+			],
 		},
 	},
 	"provider.appendOnlyContext": {
@@ -3074,9 +3105,9 @@ export const SETTINGS_SCHEMA = {
 			tab: "providers",
 			label: "Append-Only Context",
 			description:
-				"Cache system prompt + tool specs and keep an append-only message log so provider prefix caches (DeepSeek, Anthropic) hit at maximum rate. Auto enables for DeepSeek.",
+				"Cache system prompt + tool specs and keep an append-only message log so provider prefix caches (DeepSeek, Xiaomi/SGLang, Anthropic) hit at maximum rate. Auto enables for known prefix-cache providers.",
 			options: [
-				{ value: "auto", label: "Auto", description: "Enable for DeepSeek (recommended)" },
+				{ value: "auto", label: "Auto", description: "Enable for known prefix-cache providers (recommended)" },
 				{ value: "on", label: "On", description: "Always enable append-only context" },
 				{ value: "off", label: "Off", description: "Disable append-only context" },
 			],
@@ -3292,7 +3323,7 @@ export type TreeFilterMode = SettingValue<"treeFilterMode">;
 
 export interface CompactionSettings {
 	enabled: boolean;
-	strategy: "context-full" | "handoff" | "off";
+	strategy: "context-full" | "handoff" | "shake" | "off";
 	thresholdPercent: number;
 	thresholdTokens: number;
 	reserveTokens: number;
@@ -3314,6 +3345,7 @@ export interface RetrySettings {
 	maxRetries: number;
 	baseDelayMs: number;
 	maxDelayMs: number;
+	modelFallback: boolean;
 }
 
 export interface MemoriesSettings {

@@ -112,7 +112,7 @@ Core methods:
 
 - `on(event, handler)`
 - `registerTool`, `registerCommand`, `registerShortcut`, `registerFlag`
-- `registerMessageRenderer`
+- `registerMessageRenderer`, `registerAssistantThinkingRenderer`
 - `setLabel`, `getFlag`
 - `sendMessage`, `sendUserMessage`, `appendEntry`, `exec`
 - `getActiveTools`, `getAllTools`, `setActiveTools`
@@ -359,6 +359,20 @@ pi.registerMessageRenderer("my-type", (message, { expanded }, theme) => {
 
 Used by interactive rendering when custom messages are displayed.
 
+## Assistant thinking renderer
+
+```ts
+import { Container, Text } from "@oh-my-pi/pi-tui";
+
+pi.registerAssistantThinkingRenderer((context, theme) => {
+  const container = new Container();
+  container.addChild(new Text(theme.fg("dim", `thinking chars: ${context.text.length}`), 1, 0));
+  return container;
+});
+```
+
+Used by interactive rendering to add display-only supplemental UI below each visible assistant thinking block. The renderer receives the already-visible thinking text, content/thinking indexes, theme, and a `requestRender()` callback for async renderers. All registered renderers that return a component are appended in registration order. Renderers must not mutate messages; the original thinking block remains the provider/session source of truth.
+
 ## Tool call/result renderer
 
 Provide `renderCall` / `renderResult` on `registerTool` definitions for custom tool visualization in TUI.
@@ -368,7 +382,7 @@ Provide `renderCall` / `renderResult` on `registerTool` definitions for custom t
 - Runtime actions are unavailable during extension load.
 - `tool_call` errors block execution (fail-closed).
 - Command name conflicts with built-ins are skipped with diagnostics.
-- Reserved shortcuts are ignored (`ctrl+c`, `ctrl+d`, `ctrl+z`, `ctrl+k`, `ctrl+p`, `ctrl+l`, `ctrl+o`, `ctrl+t`, `ctrl+g`, `shift+tab`, `shift+ctrl+p`, `alt+enter`, `escape`, `enter`).
+- Reserved shortcuts are ignored (`ctrl+c`, `ctrl+d`, `ctrl+z`, `ctrl+k`, `ctrl+p`, `ctrl+l`, `ctrl+o`, `ctrl+t`, `ctrl+g`, `ctrl+q`, `alt+m`, `shift+tab`, `shift+ctrl+p`, `alt+enter`, `escape`, `enter`).
 - Treat `ctx.reload()` as terminal for the current command handler frame.
 
 ## Extensions vs hooks vs custom-tools

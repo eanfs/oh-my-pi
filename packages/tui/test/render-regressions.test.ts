@@ -1,5 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import { type Component, CURSOR_MARKER, type Focusable, TUI } from "@oh-my-pi/pi-tui";
+import {
+	type Component,
+	CURSOR_MARKER,
+	type Focusable,
+	setTerminalScreenToScrollback,
+	TERMINAL,
+	TUI,
+} from "@oh-my-pi/pi-tui";
 import { VirtualTerminal } from "./virtual-terminal";
 
 class MutableLinesComponent implements Component {
@@ -20,10 +27,42 @@ class MutableLinesComponent implements Component {
 	}
 }
 
+// Models a component that caches its rendered output and only refreshes it when
+// `invalidate()` fires — like a transcript block that freezes a snapshot. A
+// state change behind the cache is invisible until something invalidates it,
+// which is exactly what `resetDisplay()` must do to surface a Ctrl+O expansion.
+class CachedComponent implements Component {
+	#current: string[];
+	#cache: string[] | undefined;
+
+	constructor(lines: string[]) {
+		this.#current = [...lines];
+	}
+
+	setLines(lines: string[]): void {
+		this.#current = [...lines];
+	}
+
+	invalidate(): void {
+		this.#cache = undefined;
+	}
+
+	render(width: number): string[] {
+		if (this.#cache === undefined) {
+			this.#cache = this.#current.map(line => line.slice(0, width));
+		}
+		return this.#cache;
+	}
+}
+
 class WrappingLinesComponent implements Component {
 	#lines: string[];
 
 	constructor(lines: string[]) {
+		this.#lines = [...lines];
+	}
+
+	setLines(lines: string[]): void {
 		this.#lines = [...lines];
 	}
 
@@ -70,6 +109,24 @@ class UnknownViewportTerminal extends VirtualTerminal {
 	}
 }
 
+class StaleBottomViewportTerminal extends VirtualTerminal {
+	#previous: boolean | undefined;
+	#returnStale = false;
+
+	isNativeViewportAtBottom(): boolean | undefined {
+		const current = super.isNativeViewportAtBottom();
+		if (this.#returnStale) {
+			this.#returnStale = false;
+			const stale = this.#previous;
+			this.#previous = current;
+			return stale;
+		}
+		this.#returnStale = true;
+		this.#previous = current;
+		return current;
+	}
+}
+
 class CountingViewportTerminal extends VirtualTerminal {
 	viewportProbeCount = 0;
 
@@ -84,9 +141,21 @@ function rows(prefix: string, count: number): string[] {
 }
 
 async function settle(term: VirtualTerminal): Promise<void> {
-	await new Promise<void>(resolve => process.nextTick(resolve));
+	const nextTick = Promise.withResolvers<void>();
+	process.nextTick(nextTick.resolve);
+	await nextTick.promise;
 	await Bun.sleep(1);
 	await term.flush();
+}
+
+function captureWrites(term: VirtualTerminal): string[] {
+	const writes: string[] = [];
+	const realWrite = term.write.bind(term);
+	vi.spyOn(term, "write").mockImplementation((data: string) => {
+		writes.push(data);
+		realWrite(data);
+	});
+	return writes;
 }
 
 function visible(term: VirtualTerminal): string[] {
@@ -102,9 +171,9 @@ function countMatches(lines: string[], pattern: RegExp): number {
 }
 
 async function withEnvPatch<T>(patch: Record<string, string | undefined>, run: () => T | Promise<T>): Promise<T> {
-	const saved = new Map<string, string | undefined>();
-	for (const key of Object.keys(patch)) {
-		saved.set(key, Bun.env[key]);
+	const saved: Record<string, string | undefined> = {};
+	for (const key in patch) {
+		saved[key] = Bun.env[key];
 		const value = patch[key];
 		if (value === undefined) {
 			delete Bun.env[key];
@@ -115,7 +184,8 @@ async function withEnvPatch<T>(patch: Record<string, string | undefined>, run: (
 	try {
 		return await run();
 	} finally {
-		for (const [key, value] of saved) {
+		for (const key in saved) {
+			const value = saved[key];
 			if (value === undefined) {
 				delete Bun.env[key];
 			} else {
@@ -125,20 +195,55 @@ async function withEnvPatch<T>(patch: Record<string, string | undefined>, run: (
 	}
 }
 
+type MutableTerminalInfo = {
+	eagerEraseScrollbackRisk: boolean;
+};
+
+const mutableTerminalInfo = TERMINAL as unknown as MutableTerminalInfo;
+
+async function withTerminalRisk<T>(risk: boolean, run: () => T | Promise<T>): Promise<T> {
+	const saved = TERMINAL.eagerEraseScrollbackRisk;
+	mutableTerminalInfo.eagerEraseScrollbackRisk = risk;
+	try {
+		return await run();
+	} finally {
+		mutableTerminalInfo.eagerEraseScrollbackRisk = saved;
+	}
+}
+
 describe("TUI terminal-state regressions", () => {
 	let monotonicNow = 0;
-	// Keep TUI's 16ms render throttle deterministic without sleeping a real frame per render.
+	// Keep TUI's ~33ms render throttle deterministic without sleeping a real frame per render.
 
 	beforeEach(() => {
 		monotonicNow = 0;
 		vi.spyOn(performance, "now").mockImplementation(() => {
-			monotonicNow += 20;
+			monotonicNow += 40;
 			return monotonicNow;
 		});
 	});
 
 	afterEach(() => {
 		vi.restoreAllMocks();
+	});
+
+	it("coalesces non-force render requests to 30fps", () => {
+		const delays: number[] = [];
+		const renderScheduler = {
+			now: () => 0,
+			scheduleImmediate: (callback: () => void) => callback(),
+			scheduleRender: (_callback: () => void, delayMs: number) => {
+				delays.push(delayMs);
+				return { cancel: () => {} };
+			},
+		};
+		const tui = new TUI(new VirtualTerminal(20, 4), true, { renderScheduler });
+
+		tui.requestRender();
+
+		expect(delays).toHaveLength(1);
+		expect(delays[0]!).toBeCloseTo(1000 / 30, 5);
+		tui.stop();
 	});
 
 	describe("cursor + differential stability", () => {
@@ -185,6 +290,33 @@ describe("TUI terminal-state regressions", () => {
 				expect(after[2]?.trim()).toBe("XXX");
 				expect(after[3]).toBe(before[3]);
 				expect(after[4]).toBe(before[4]);
+			} finally {
+				tui.stop();
+			}
+		});
+		it("rewrites changed rows before clearing suffixes for non-synchronized hosts", async () => {
+			const term = new VirtualTerminal(40, 8);
+			const tui = new TUI(term);
+			const component = new MutableLinesComponent([
+				"assistant output already rendered",
+				"tool output already rendered",
+				"todos/status already rendered",
+			]);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				const writes = captureWrites(term);
+
+				component.setLines(["assistant output already rendered", "tool", "todos/status already rendered"]);
+				tui.requestRender();
+				await settle(term);
+
+				const paint = writes.at(-1) ?? "";
+				expect(paint).toContain("tool\x1b[0m\x1b[K");
+				expect(paint).not.toContain("\x1b[2Ktool");
+				expect(visible(term)[1]).toBe("tool");
 			} finally {
 				tui.stop();
 			}
@@ -237,10 +369,161 @@ describe("TUI terminal-state regressions", () => {
 				tui.stop();
 			}
 		});
+
+		it("appends overflowing content after a legitimately empty previous frame", async () => {
+			const term = new VirtualTerminal(20, 3);
+			const tui = new TUI(term);
+			const component = new MutableLinesComponent([]);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				component.setLines(["A", "B", "C", "D", "E"]);
+				tui.requestRender();
+				await settle(term);
+
+				expect(term.getScrollBuffer().map(line => line.trimEnd())).toEqual(["A", "B", "C", "D", "E"]);
+				expect(visible(term)).toEqual(["C", "D", "E"]);
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("does not duplicate scrollback when two forced renders coalesce in one tick", async () => {
+			const term = new VirtualTerminal(20, 3);
+			const tui = new TUI(term);
+			const component = new MutableLinesComponent(rows("L", 8));
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				// Two forced renders queued before the render flush must still be
+				// treated as a single drop of the already-committed transcript;
+				// otherwise the second one re-emits the whole frame into scrollback.
+				tui.requestRender(true);
+				tui.requestRender(true);
+				await settle(term);
+
+				const occurrences = term
+					.getScrollBuffer()
+					.map(line => line.trimEnd())
+					.filter(line => line === "L0").length;
+				expect(occurrences).toBe(1);
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("resetDisplay performs a clean redraw without a geometry change", async () => {
+			const term = new VirtualTerminal(20, 3);
+			const tui = new TUI(term);
+			const component = new MutableLinesComponent(rows("L", 8));
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				const writes = captureWrites(term);
+
+				tui.resetDisplay();
+				await settle(term);
+
+				expect(writes.some(write => write.includes("\x1b[2J\x1b[H\x1b[3J"))).toBe(true);
+				expect(term.getScrollBuffer().map(line => line.trimEnd())).toEqual(rows("L", 8));
+				expect(visible(term)).toEqual(["L5", "L6", "L7"]);
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("resetDisplay surfaces a state change hidden behind a component's render cache", async () => {
+			const term = new VirtualTerminal(20, 3);
+			const tui = new TUI(term);
+			const component = new CachedComponent(rows("L", 8));
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				expect(visible(term)).toEqual(["L5", "L6", "L7"]);
+
+				// The component's content changes, but its render stays cached (a
+				// frozen transcript snapshot). resetDisplay() must invalidate it so the
+				// forced replay reflects the new content rather than the stale cache —
+				// the Ctrl+O expansion path depends on this.
+				component.setLines(rows("M", 8));
+				tui.resetDisplay();
+				await settle(term);
+
+				expect(term.getScrollBuffer().map(line => line.trimEnd())).toEqual(rows("M", 8));
+				expect(visible(term)).toEqual(["M5", "M6", "M7"]);
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("keeps appended rows in scrollback when a forced render coalesces with content growth", async () => {
+			const term = new VirtualTerminal(20, 3);
+			const tui = new TUI(term);
+			const component = new MutableLinesComponent(rows("L", 5));
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				tui.requestRender(true);
+				component.setLines(rows("L", 6));
+				tui.requestRender();
+				await settle(term);
+
+				expect(term.getScrollBuffer().map(line => line.trimEnd())).toEqual(rows("L", 6));
+				expect(visible(term)).toEqual(["L3", "L4", "L5"]);
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("does not yank a scrolled viewport for pure tail appends", async () => {
+			const term = new VirtualTerminal(20, 3, 5);
+			const tui = new TUI(term);
+			const component = new MutableLinesComponent(rows("L", 8));
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				term.scrollLines(-1);
+
+				const beforePosition = term.getBufferPosition();
+				const beforeView = visible(term);
+
+				component.setLines(rows("L", 9));
+				tui.requestRender();
+				await settle(term);
+
+				expect(term.getBufferPosition()).toEqual(beforePosition);
+				expect(visible(term)).toEqual(beforeView);
+
+				term.scrollLines(1_000_000);
+				expect(tui.refreshNativeScrollbackIfDirty({ allowUnknownViewport: true })).toBeTrue();
+				await term.flush();
+				expect(term.getScrollBuffer().map(line => line.trimEnd())).toEqual(rows("L", 9).slice(1));
+			} finally {
+				tui.stop();
+			}
+		});
 	});
 
 	describe("resize + viewport behavior", () => {
-		it("preserves preexisting shell scrollback on startup and resize redraw", async () => {
+		it("clears preexisting shell scrollback on a resize redraw (clean reset)", async () => {
+			// A resize is a clean reset: the renderer clears the viewport and
+			// scrollback (ED2+ED3) and redraws the transcript at the new geometry, so
+			// preexisting shell scrollback above the UI does not survive.
 			const term = new VirtualTerminal(50, 5);
 			term.write("shell-0\r\nshell-1\r\nshell-2\r\nshell-3\r\nshell-4\r\n");
 			await settle(term);
@@ -257,9 +540,95 @@ describe("TUI terminal-state regressions", () => {
 				await settle(term);
 
 				const buffer = term.getScrollBuffer().join("\n");
-				expect(buffer.includes("shell-")).toBeTruthy();
+				expect(buffer.includes("shell-")).toBeFalsy();
+				expect(visible(term).at(-1)?.trim()).toBe("ui-7");
 			} finally {
 				tui.stop();
+			}
+		});
+
+		// Root cause: the renderer detected geometry changes by diffing dimensions
+		// between frames, so a resize round trip that nets out unchanged by render
+		// time (rapid SIGWINCH during a window drag, coalesced into one frame
+		// budget) was invisible — but the terminal reflowed its buffer on each
+		// event, moving rows between viewport and scrollback (and evicting some at
+		// the cap), so diffing against the pre-resize screen splices blank phantom
+		// rows into the viewport. The resize EVENT must mark the frame
+		// geometry-changed regardless of the net dimension delta.
+		it("repaints after a resize round trip whose dimensions net out unchanged", async () => {
+			await withEnvPatch({ TMUX: undefined, STY: undefined, ZELLIJ: undefined }, async () => {
+				const term = new VirtualTerminal(16, 6, 5);
+				const tui = new TUI(term);
+				const lines = rows("line-", 30);
+				// Park the hardware cursor above the bottom row (focused editor row):
+				// the diff emitter's scroll math is relative to this position, and the
+				// resize round trip moves the real cursor out from under it.
+				lines[28] = `line-28${CURSOR_MARKER}`;
+				const component = new MutableLinesComponent(lines);
+				tui.addChild(component);
+
+				try {
+					tui.start();
+					await settle(term);
+
+					// One frame budget: shrink, stream a row, grow back. The renderer
+					// sees height 6 -> 6 (no net change) plus one appended row.
+					term.resize(16, 4);
+					lines.push("line-30 streamed");
+					component.setLines(lines);
+					term.resize(16, 6);
+					await settle(term);
+
+					expect(visible(term)).toEqual([
+						"line-25",
+						"line-26",
+						"line-27",
+						"line-28",
+						"line-29",
+						"line-30 streamed",
+					]);
+				} finally {
+					tui.stop();
+				}
+			});
+		});
+
+		it("rewraps committed native scrollback when the terminal widens on POSIX (unknown viewport)", async () => {
+			// POSIX reports no viewport position. A resize is now an unconditional
+			// clean reset: the renderer clears scrollback (ED3) and redraws the
+			// transcript at the new width, so committed history rewraps even when the
+			// host scroll position is unobservable.
+			const originalPlatform = process.platform;
+			Object.defineProperty(process, "platform", { configurable: true, value: "linux" });
+			try {
+				await withEnvPatch({ TMUX: undefined, STY: undefined, ZELLIJ: undefined }, async () => {
+					// Each logical line is 36 cols: wraps to 20+16 at width 20, fits on one row at width 40.
+					const logical = Array.from({ length: 10 }, (_v, i) => `L${i}:${"x".repeat(33)}`);
+					const term = new UnknownViewportTerminal(20, 4, 200);
+					const tui = new TUI(term);
+					const component = new WrappingLinesComponent(logical);
+					tui.addChild(component);
+
+					try {
+						tui.start();
+						await settle(term);
+						const narrow = term.getScrollBuffer().map(line => line.trimEnd());
+						// Precondition: history is wrapped narrow (L0 split into a 20-col fragment).
+						expect(narrow).toContain(`L0:${"x".repeat(17)}`);
+
+						term.resize(40, 4);
+						await settle(term);
+
+						const wide = term.getScrollBuffer().map(line => line.trimEnd());
+						// The resize rewraps history at the new width; the narrow fragment is gone.
+						expect(wide).toContain(`L0:${"x".repeat(33)}`);
+						expect(wide).not.toContain(`L0:${"x".repeat(17)}`);
+					} finally {
+						tui.stop();
+					}
+				});
+			} finally {
+				Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
 			}
 		});
 
@@ -283,6 +652,39 @@ describe("TUI terminal-state regressions", () => {
 				expect(viewport[0]!.length).toBeLessThanOrEqual(16);
 				expect(viewport[1]!.length).toBeLessThanOrEqual(16);
 				expect(viewport[2]?.trim()).toBe("");
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("width shrink rebuilds stale native history before later appends", async () => {
+			const term = new VirtualTerminal(40, 3, 200);
+			const tui = new TUI(term);
+			const component = new WrappingLinesComponent(["A".repeat(20), "B".repeat(20)]);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				// Root cause: shrinking the width can turn a frame that fit on screen
+				// into overflowing wrapped rows. A viewport repaint leaves the old
+				// terminal-reflowed fragments in native history; the next append then
+				// grows scrollback by fewer rows than the logical frame grew.
+				term.resize(10, 3);
+				await settle(term);
+				component.setLines(["A".repeat(20), "B".repeat(20), "C".repeat(20)]);
+				tui.requestRender();
+				await settle(term);
+
+				expect(term.getScrollBuffer().map(line => line.trimEnd())).toEqual([
+					"AAAAAAAAAA",
+					"AAAAAAAAAA",
+					"BBBBBBBBBB",
+					"BBBBBBBBBB",
+					"CCCCCCCCCC",
+					"CCCCCCCCCC",
+				]);
 			} finally {
 				tui.stop();
 			}
@@ -733,10 +1135,246 @@ describe("TUI terminal-state regressions", () => {
 				tui.stop();
 			}
 		}, 15_000);
+
+		it("keeps appended rows contiguous when a height grow coincides with new content", async () => {
+			// A terminal resize fires requestRender(), and streamed content fires
+			// its own requestRender(); the ~33ms throttle coalesces them into a
+			// single frame that is both taller and longer. The diff/append-tail
+			// emitters position scrolled rows against the previous viewport top and
+			// hardware cursor row, both invalidated by the reflow — so the appended
+			// tail used to slip down by the height delta, leaving a blank gap.
+			const term = new VirtualTerminal(40, 12);
+			const tui = new TUI(term);
+			const component = new MutableLinesComponent(rows("line-", 16));
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				term.resize(40, 24);
+				component.setLines(rows("line-", 19));
+				tui.requestRender();
+				await settle(term);
+
+				// 19 lines fit inside the 24-row viewport: rows 0..18 hold content,
+				// 19..23 stay blank — with no 4-row (height delta) displacement.
+				expect(visible(term)).toEqual([...rows("line-", 19), "", "", "", "", ""]);
+				const position = term.getBufferPosition();
+				expect(position.viewportY).toBe(position.baseY);
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("keeps native scrollback row-exact when a height shrink coalesces with streamed appends", async () => {
+			// Stress repro: darwin-normal-large seed 0x5eed1234 op 1062. A height
+			// SHRINK coalesced into the same frame as a streamed append, with content
+			// overflowing the viewport, fell through to the diff emitter. The
+			// terminal's resize reflow had already moved committed rows between
+			// scrollback and viewport, so the emitter's previous-frame anchors were
+			// stale and its relative scroll spliced a phantom blank row into native
+			// scrollback; every later append stayed offset by one row. Geometry
+			// changes must instead rebuild history (viewport at bottom) or defer —
+			// never diff against pre-reflow anchors.
+			const term = new VirtualTerminal(40, 8);
+			const tui = new TUI(term);
+			const lines = rows("row-", 14);
+			const component = new MutableLinesComponent(lines);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				// Coalesce: height shrink 8→4 + streamed append in one frame.
+				term.resize(40, 4);
+				component.setLines([...lines, "stream-0"]);
+				tui.requestRender();
+				await settle(term);
+
+				// Follow-up plain appends must land contiguously after the streamed row.
+				const final = [...lines, "stream-0", "tail-0", "tail-1", "tail-2"];
+				component.setLines(final);
+				tui.requestRender();
+				await settle(term);
+
+				// Scrolling back must show exactly the transcript: no phantom blank
+				// row, no offset rows, no duplicates.
+				expect(term.getScrollBuffer().map(line => line.trimEnd())).toEqual(final);
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("repaints content at the new geometry on a Termux resize-with-append (not the stale-anchor diff)", async () => {
+			// Stress repro: linux-normal-termux-large seed 0x207adeeb op 11. Termux
+			// was excluded from every geometry-change repaint branch (to avoid churn
+			// on software-keyboard height toggles), so a real resize carrying new
+			// content fell through to the diff/append emitter, which scrolls relative
+			// to the pre-resize viewport top — offsetting the appended rows by the
+			// geometry delta. Pure height changes repaint too: otherwise the terminal
+			// exposes blank rows that a later append can fill without growing
+			// scrollback.
+			await withEnvPatch({ TERMUX_VERSION: "0.118" }, async () => {
+				const term = new VirtualTerminal(120, 12);
+				const tui = new TUI(term);
+				const lines = rows("row-", 14);
+				const component = new MutableLinesComponent(lines);
+				tui.addChild(component);
+
+				try {
+					tui.start();
+					await settle(term);
+
+					// Resize (rotation: 120×12 → 80×24) coalesced with a 3-row append.
+					// 17 rows fit the 24-row viewport, so they must be contiguous from
+					// the top with no geometry-delta displacement.
+					term.resize(80, 24);
+					const final = [...lines, "app-0", "app-1", "app-2"];
+					component.setLines(final);
+					tui.requestRender();
+					await settle(term);
+
+					expect(visible(term)).toEqual([...final, ...Array<string>(24 - final.length).fill("")]);
+				} finally {
+					tui.stop();
+				}
+			});
+		});
+
+		it("repaints pure Termux height grows so later appends cannot fill phantom blank rows", async () => {
+			// Stress repro: linux-normal-termux-small seed 0x207adeeb op 1257-1259.
+			// A pure Termux height grow (software keyboard/rotation, no content
+			// change) used to no-op. The terminal exposed two blank rows at the bottom
+			// of the viewport, and the next append wrote into that phantom space
+			// instead of scrolling a new row into native history, breaking row
+			// accounting and hiding the true frame tail.
+			await withEnvPatch({ TERMUX_VERSION: "0.118" }, async () => {
+				const term = new VirtualTerminal(16, 4, 100);
+				const tui = new TUI(term);
+				const lines = rows("row-", 12);
+				const component = new MutableLinesComponent(lines);
+				tui.addChild(component);
+
+				try {
+					tui.start();
+					await settle(term);
+
+					term.resize(16, 6);
+					await settle(term);
+					expect(visible(term)).toEqual(lines.slice(6));
+
+					const final = [...lines, "row-12"];
+					component.setLines(final);
+					tui.requestRender();
+					await settle(term);
+
+					expect(visible(term)).toEqual(final.slice(7));
+					expect(term.getScrollBuffer().map(line => line.trimEnd())).toEqual(final);
+				} finally {
+					tui.stop();
+				}
+			});
+		});
+	});
+
+	describe("screen clearing", () => {
+		it("saves to scrollback and clears the viewport for supported non-destructive full paints", async () => {
+			const saved = TERMINAL.supportsScreenToScrollback;
+			setTerminalScreenToScrollback(true);
+			const term = new VirtualTerminal(20, 5);
+			const tui = new TUI(term);
+			tui.addChild(new MutableLinesComponent(["hello"]));
+			const writes = captureWrites(term);
+
+			try {
+				tui.start();
+				await settle(term);
+				const out = writes.join("");
+				const screenToScrollback = out.indexOf("\x1b[22J");
+				const viewportClear = out.indexOf("\x1b[2J\x1b[H");
+				expect(screenToScrollback).toBeGreaterThanOrEqual(0);
+				expect(viewportClear).toBeGreaterThanOrEqual(0);
+				expect(screenToScrollback).toBeLessThan(viewportClear);
+				expect(out).not.toContain("\x1b[3J");
+			} finally {
+				tui.stop();
+				setTerminalScreenToScrollback(saved);
+			}
+		});
+
+		it("clears stale screen content on a supported non-destructive paint when the terminal ignores CSI 22 J", async () => {
+			const saved = TERMINAL.supportsScreenToScrollback;
+			setTerminalScreenToScrollback(true);
+			const term = new VirtualTerminal(40, 8);
+			// A previous program's screen the TUI must not leave behind.
+			term.write("\x1b[H");
+			for (let r = 0; r < 6; r++) term.write(`STALE-ROW-${r} leftover content\r\n`);
+			await term.flush();
+			const tui = new TUI(term);
+			tui.addChild(new MutableLinesComponent(["omp line 1", "omp line 2"]));
+
+			try {
+				tui.start();
+				await settle(term);
+				const viewport = term.getViewport().join("\n");
+				expect(viewport).not.toContain("STALE-ROW");
+				expect(viewport).toContain("omp line 1");
+			} finally {
+				tui.stop();
+				setTerminalScreenToScrollback(saved);
+			}
+		});
+
+		it("keeps CSI 2 J as the non-destructive fallback", async () => {
+			const saved = TERMINAL.supportsScreenToScrollback;
+			setTerminalScreenToScrollback(false);
+			const term = new VirtualTerminal(20, 5);
+			const tui = new TUI(term);
+			tui.addChild(new MutableLinesComponent(["hello"]));
+			const writes = captureWrites(term);
+
+			try {
+				tui.start();
+				await settle(term);
+				const out = writes.join("");
+				expect(out).toContain("\x1b[2J\x1b[H");
+				expect(out).not.toContain("\x1b[22J");
+				expect(out).not.toContain("\x1b[3J");
+			} finally {
+				tui.stop();
+				setTerminalScreenToScrollback(saved);
+			}
+		});
+
+		it("uses ED3 for destructive rebuilds even when CSI 22 J is supported", async () => {
+			const saved = TERMINAL.supportsScreenToScrollback;
+			setTerminalScreenToScrollback(true);
+			const term = new VirtualTerminal(20, 3);
+			const tui = new TUI(term);
+			tui.addChild(new MutableLinesComponent(rows("line-", 6)));
+			const writes = captureWrites(term);
+
+			try {
+				tui.start();
+				await settle(term);
+				writes.length = 0;
+
+				tui.requestRender(true, { clearScrollback: true });
+				await settle(term);
+				const out = writes.join("");
+				expect(out).toContain("\x1b[2J\x1b[H\x1b[3J");
+				expect(out).not.toContain("\x1b[22J");
+			} finally {
+				tui.stop();
+				setTerminalScreenToScrollback(saved);
+			}
+		});
 	});
 
 	describe("scrollback integrity", () => {
-		it("does not probe native viewport state during pure appends", async () => {
+		it("does not probe native viewport state before appends can affect scrollback", async () => {
 			const term = new CountingViewportTerminal(32, 5);
 			const tui = new TUI(term);
 			const lines = rows("line-", 3);
@@ -747,7 +1385,7 @@ describe("TUI terminal-state regressions", () => {
 				tui.start();
 				await settle(term);
 
-				for (let i = 3; i < 20; i++) {
+				for (let i = 3; i < 5; i++) {
 					lines.push(`line-${i}`);
 					component.setLines(lines);
 					tui.requestRender();
@@ -778,6 +1416,218 @@ describe("TUI terminal-state regressions", () => {
 			} finally {
 				tui.stop();
 			}
+		});
+
+		// Root cause: inside a multiplexer, #planRender routed dirty-scrollback
+		// live frames to historyRebuild/overlayRebuild, but the full-frame replay
+		// cannot clear tmux pane history (clearScrollback is forced off there), so
+		// every dirty->rebuild cycle appended a complete duplicate copy of the
+		// transcript to pane history. Live frames must keep repainting the
+		// viewport and leave reconciliation to explicit checkpoints.
+		it("tmux: dirty-scrollback live frames do not replay the transcript into pane history", async () => {
+			await withEnvPatch({ TMUX: "1", STY: undefined, ZELLIJ: undefined }, async () => {
+				const term = new VirtualTerminal(40, 5, 10_000);
+				const tui = new TUI(term);
+				const lines = rows("line-", 30);
+				const component = new MutableLinesComponent(lines);
+				tui.addChild(component);
+
+				try {
+					tui.start();
+					await settle(term);
+					const baseYAfterStart = term.getBufferPosition().baseY;
+
+					// An offscreen edit in tmux defers: viewport repaint + scrollback
+					// marked dirty (pane history cannot be rewritten).
+					lines[2] = "line-2 edited";
+					component.setLines(lines);
+					tui.requestRender();
+					await settle(term);
+
+					// The next frame (a pure tail append) must NOT flush the dirty flag
+					// through a full transcript replay: pane history would gain a
+					// duplicate copy of every row.
+					lines.push("line-30");
+					component.setLines(lines);
+					tui.requestRender();
+					await settle(term);
+
+					const baseYGrowth = term.getBufferPosition().baseY - baseYAfterStart;
+					expect(baseYGrowth).toBeLessThanOrEqual(1);
+
+					const scrollback = term.getScrollBuffer();
+					for (const probe of [0, 1, 10, 20, 29]) {
+						const pattern = new RegExp(`\\bline-${probe}\\b`);
+						expect(
+							countMatches(scrollback, pattern),
+							`line-${probe} must appear exactly once in pane history`,
+						).toBe(1);
+					}
+				} finally {
+					tui.stop();
+				}
+			});
+		});
+
+		it("tmux: offscreen shrink preserving the visible tail emits no repaint bytes", async () => {
+			await withEnvPatch({ TMUX: "1", STY: undefined, ZELLIJ: undefined }, async () => {
+				const term = new UnknownViewportTerminal(40, 4, 10_000);
+				const tui = new TUI(term);
+				const component = new MutableLinesComponent([
+					"old-0",
+					"remove-me",
+					"old-2",
+					"old-3",
+					"tail-0",
+					"tail-1",
+					"tail-2",
+					"tail-3",
+				]);
+				tui.addChild(component);
+
+				try {
+					tui.start();
+					await settle(term);
+					expect(visible(term)).toEqual(["tail-0", "tail-1", "tail-2", "tail-3"]);
+
+					const writes = captureWrites(term);
+					component.setLines(["old-0", "old-2", "old-3", "tail-0", "tail-1", "tail-2", "tail-3"]);
+					tui.requestRender();
+					await settle(term);
+
+					expect(visible(term)).toEqual(["tail-0", "tail-1", "tail-2", "tail-3"]);
+					expect(writes).toEqual([]);
+				} finally {
+					tui.stop();
+				}
+			});
+		});
+
+		// Root cause family: the dirty/replay machinery assumes native scrollback
+		// can be cleared and rebuilt, which is never true inside a multiplexer —
+		// tmux owns pane history, reflows it on resize itself, and a "replay" can
+		// only append a duplicate copy of the transcript on top of it.
+		describe("tmux: destructive scrollback reconciliation is impossible", () => {
+			const TMUX_ENV = { TMUX: "1", STY: undefined, ZELLIJ: undefined };
+
+			// Hole A: a resize racing a streamed append in the same frame (SIGWINCH +
+			// token) reached the diff/append emitters, whose scroll math is anchored
+			// to the pre-reflow viewport top — tmux reflowed the pane grid, so the
+			// anchors are stale and rows land in the wrong place.
+			it("repaints the viewport when a resize and an append land in one frame", async () => {
+				await withEnvPatch(TMUX_ENV, async () => {
+					const term = new VirtualTerminal(40, 12, 10_000);
+					const tui = new TUI(term);
+					const lines = rows("line-", 40);
+					const component = new MutableLinesComponent(lines);
+					tui.addChild(component);
+
+					try {
+						tui.start();
+						await settle(term);
+
+						// SIGWINCH (height shrink) and a streamed token arrive inside the
+						// same multiplexer-resize debounce window. The TUI coalesces every
+						// SIGWINCH into one settled forced render once the pane stops
+						// resizing (issue #2088); the streamed append rides along on the
+						// eventual render at the new geometry.
+						lines.push("line-40 streamed");
+						component.setLines(lines);
+						term.resize(40, 6);
+						await Bun.sleep(80);
+						await settle(term);
+
+						// The visible pane must show the frame tail at the new geometry —
+						// no phantom rows, no stale-anchor splices.
+						const view = visible(term);
+						expect(view).toEqual(["line-35", "line-36", "line-37", "line-38", "line-39", "line-40 streamed"]);
+					} finally {
+						tui.stop();
+					}
+				});
+			});
+
+			// Hole B: a forced render that races a resize promoted the frame to
+			// sessionReplace via #prepareForcedRender's replayGeometry, but the
+			// "replay" cannot clear tmux pane history — it only appended a full
+			// duplicate copy of the transcript.
+			it("does not replay the transcript into pane history on a forced render after resize", async () => {
+				await withEnvPatch(TMUX_ENV, async () => {
+					const term = new VirtualTerminal(40, 12, 10_000);
+					const tui = new TUI(term);
+					const component = new MutableLinesComponent(rows("line-", 40));
+					tui.addChild(component);
+
+					try {
+						tui.start();
+						await settle(term);
+						const baseYAfterStart = term.getBufferPosition().baseY;
+
+						// Embedder force-redraws while a resize is still unprocessed.
+						term.resize(40, 6);
+						tui.requestRender(true);
+						await settle(term);
+
+						// xterm/tmux reflow on a 12 -> 6 height shrink moves at most 6 rows
+						// into pane history; a transcript replay would add ~40 more.
+						const baseYGrowth = term.getBufferPosition().baseY - baseYAfterStart;
+						expect(baseYGrowth).toBeLessThanOrEqual(6);
+
+						const scrollback = term.getScrollBuffer();
+						for (const probe of [0, 10, 20, 30]) {
+							const pattern = new RegExp(`\\bline-${probe}\\b`);
+							expect(
+								countMatches(scrollback, pattern),
+								`line-${probe} must appear exactly once in pane history`,
+							).toBe(1);
+						}
+					} finally {
+						tui.stop();
+					}
+				});
+			});
+
+			// Hole C: the prompt-submit checkpoint (refreshNativeScrollbackIfDirty)
+			// ran a sessionReplace for dirty scrollback, dumping a full transcript
+			// copy into pane history on every submit that followed streaming.
+			it("refreshNativeScrollbackIfDirty is a no-op inside a multiplexer", async () => {
+				await withEnvPatch(TMUX_ENV, async () => {
+					const term = new VirtualTerminal(40, 6, 10_000);
+					const tui = new TUI(term);
+					const lines = rows("line-", 30);
+					const component = new MutableLinesComponent(lines);
+					tui.addChild(component);
+
+					try {
+						tui.start();
+						await settle(term);
+
+						// Offscreen edit during streaming marks scrollback dirty.
+						lines[2] = "line-2 edited";
+						component.setLines(lines);
+						tui.requestRender();
+						await settle(term);
+						const baseYBeforeCheckpoint = term.getBufferPosition().baseY;
+
+						// Prompt submit: the checkpoint must not dump the transcript into
+						// pane history (there is nothing it can reconcile in tmux).
+						expect(tui.refreshNativeScrollbackIfDirty({ allowUnknownViewport: true })).toBe(false);
+						await settle(term);
+
+						expect(term.getBufferPosition().baseY).toBe(baseYBeforeCheckpoint);
+						const scrollback = term.getScrollBuffer();
+						for (const probe of [0, 10, 20, 29]) {
+							const pattern = new RegExp(`\\bline-${probe}\\b`);
+							expect(
+								countMatches(scrollback, pattern),
+								`line-${probe} must appear exactly once in pane history`,
+							).toBe(1);
+						}
+					} finally {
+						tui.stop();
+					}
+				});
+			});
 		});
 
 		it("appending lines during aggressive resize does not duplicate history rows", async () => {
@@ -850,7 +1700,7 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 
-		it("defers resize rebuild while native scrollback is scrolled", async () => {
+		it("rebuilds in place even when the reader is scrolled (clean reset on resize)", async () => {
 			const term = new VirtualTerminal(32, 5);
 			const tui = new TUI(term);
 			const component = new MutableLinesComponent(rows("line-", 12));
@@ -860,16 +1710,20 @@ describe("TUI terminal-state regressions", () => {
 				tui.start();
 				await settle(term);
 				term.scrollLines(-2);
-				const before = term.getBufferPosition();
-				expect(before.viewportY).toBeGreaterThan(0);
+				expect(term.getBufferPosition().viewportY).toBeGreaterThan(0);
 
 				component.setLines(rows("line-", 8));
 				term.resize(28, 5);
 				await settle(term);
 
-				const after = term.getBufferPosition();
-				expect(after.viewportY).toBe(before.viewportY);
-				expect(visible(term).map(line => line.trim())).toEqual(["line-5", "line-6", "line-7", "", ""]);
+				// A resize is a clean reset: history is rebuilt in place at the new
+				// geometry instead of deferring to keep the reader scrolled. Each line
+				// appears exactly once and nothing is left deferred.
+				const buffer = term.getScrollBuffer().map(line => line.trim());
+				for (let i = 0; i < 8; i++) {
+					expect(buffer.filter(line => line === `line-${i}`).length).toBe(1);
+				}
+				expect(buffer.filter(line => line.startsWith("line-")).length).toBe(8);
 				expect(tui.refreshNativeScrollbackIfDirty()).toBe(false);
 			} finally {
 				tui.stop();
@@ -947,12 +1801,46 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 
+		it("does not duplicate the viewport-top row when an offscreen edit repeats the tail", async () => {
+			// 6 rows over height 4: scrollback ["E0","E1"], viewport ["a","b","c","d"].
+			const term = new VirtualTerminal(32, 4);
+			const tui = new TUI(term);
+			const component = new MutableLinesComponent(["E0", "E1", "a", "b", "c", "d"]);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				expect(term.isNativeViewportAtBottom()).toBe(true);
+				expect(visible(term).map(line => line.trim())).toEqual(["a", "b", "c", "d"]);
+
+				// An offscreen edit (E0 -> E0x, above the viewport top) lands together
+				// with a tail append whose rows make the prior last line "d" recur one
+				// row early. The append-tail heuristic then mis-locates the tail and,
+				// before the fix, scrolled an extra row into history — duplicating the
+				// viewport-top row "b" just above the viewport.
+				component.setLines(["E0x", "E1", "a", "b", "d", "e", "f"]);
+				tui.requestRender();
+				await settle(term);
+
+				expect(visible(term).map(line => line.trim())).toEqual(["b", "d", "e", "f"]);
+				const buffer = term.getScrollBuffer().map(line => line.trimEnd());
+				for (const line of ["E0x", "E1", "a", "b", "d", "e", "f"]) {
+					expect(buffer.filter(row => row === line).length, `${line} should appear exactly once`).toBe(1);
+				}
+				// The offscreen edit must be reflected in history, not left stale.
+				expect(buffer).not.toContain("E0");
+			} finally {
+				tui.stop();
+			}
+		});
+
 		it("removes collapsed ctrl-o markers from scrollback after offscreen expansion", async () => {
 			const term = new VirtualTerminal(48, 6);
 			const tui = new TUI(term);
 			const collapsedLines = [
 				"frame-top",
-				"code preview … 16 more lines ⟨(Ctrl+O for more)⟩",
+				"code preview … 16 more lines ⟨Ctrl+O: Expand⟩",
 				"output preview … 106 more lines (ctrl+o to expand)",
 				...rows("json-", 10),
 				"status",
@@ -977,6 +1865,102 @@ describe("TUI terminal-state regressions", () => {
 					"editor",
 				]);
 				tui.requestRender();
+				await settle(term);
+
+				const scrollback = term.getScrollBuffer();
+				const scrollbackText = scrollback.join("\n");
+				expect(scrollbackText).not.toContain("ctrl+o");
+				expect(scrollbackText).toContain("code line 1");
+				expect(scrollbackText).toContain("output line 1");
+				for (let i = 0; i < 10; i++) {
+					const pattern = new RegExp(`\\bjson-${i}\\b`);
+					expect(countMatches(scrollback, pattern), `json-${i} should appear exactly once`).toBe(1);
+				}
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("defers offscreen expansion rebuild when the viewport position is unknown", async () => {
+			// POSIX terminals cannot report whether the user scrolled up, so an
+			// ordinary offscreen expansion must NOT destructively rebuild scrollback
+			// (anti-yank). The collapsed ctrl+o markers that scrolled into history
+			// therefore stay stale until the next checkpoint — this is the deferral
+			// that makes an un-flagged Ctrl+O expand look broken above the fold.
+			const term = new UnknownViewportTerminal(48, 6);
+			const tui = new TUI(term);
+			const component = new MutableLinesComponent([
+				"frame-top",
+				"code preview … 16 more lines ⟨Ctrl+O: Expand⟩",
+				"output preview … 106 more lines (ctrl+o to expand)",
+				...rows("json-", 10),
+				"status",
+				"editor",
+			]);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				expect(term.isNativeViewportAtBottom()).toBeUndefined();
+				expect(term.getScrollBuffer().join("\n")).toContain("ctrl+o");
+
+				component.setLines([
+					"frame-top",
+					"code line 0",
+					"code line 1",
+					"output line 0",
+					"output line 1",
+					...rows("json-", 10),
+					"status",
+					"editor",
+				]);
+				tui.requestRender();
+				await settle(term);
+
+				// No flag: the rebuild is deferred, so the stale markers survive offscreen.
+				expect(term.getScrollBuffer().join("\n")).toContain("ctrl+o");
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("rebuilds scrollback on a user-driven offscreen expansion when the viewport position is unknown", async () => {
+			// Pressing Ctrl+O is a direct user keystroke, so the expand reaches the
+			// renderer with `allowUnknownViewportMutation: true`. On a terminal that
+			// cannot report viewport position (POSIX), that opt-in is the only thing
+			// that promotes the offscreen structural mutation to a clean history
+			// rebuild instead of a partial viewport repaint — without it the collapsed
+			// preview rows linger above the fold and the expansion renders garbled.
+			const term = new UnknownViewportTerminal(48, 6);
+			const tui = new TUI(term);
+			const component = new MutableLinesComponent([
+				"frame-top",
+				"code preview … 16 more lines ⟨Ctrl+O: Expand⟩",
+				"output preview … 106 more lines (ctrl+o to expand)",
+				...rows("json-", 10),
+				"status",
+				"editor",
+			]);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				expect(term.isNativeViewportAtBottom()).toBeUndefined();
+				expect(term.getScrollBuffer().join("\n")).toContain("ctrl+o");
+
+				component.setLines([
+					"frame-top",
+					"code line 0",
+					"code line 1",
+					"output line 0",
+					"output line 1",
+					...rows("json-", 10),
+					"status",
+					"editor",
+				]);
+				tui.requestRender(false, { allowUnknownViewportMutation: true });
 				await settle(term);
 
 				const scrollback = term.getScrollBuffer();
@@ -1037,6 +2021,32 @@ describe("TUI terminal-state regressions", () => {
 				expect((allText.match(/alpha/g) ?? []).length).toBe(1);
 				expect((allText.match(/beta/g) ?? []).length).toBe(1);
 				expect((allText.match(/gamma/g) ?? []).length).toBe(1);
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("rebuilds scrollback when a bottom-anchored high-water preview collapses", async () => {
+			const term = new VirtualTerminal(40, 5);
+			const highWaterFrame = [...rows("base-", 8), ...rows("preview-", 10)];
+			const finalFrame = [...rows("base-", 8), "result-0", "result-1"];
+			const tui = new TUI(term);
+			const component = new MutableLinesComponent(highWaterFrame);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				expect(term.getScrollBuffer().map(line => line.trimEnd())).toEqual(highWaterFrame);
+				expect(term.getBufferPosition().viewportY).toBe(term.getBufferPosition().baseY);
+
+				component.setLines(finalFrame);
+				tui.requestRender();
+				await settle(term);
+
+				expect(term.getScrollBuffer().map(line => line.trimEnd())).toEqual(finalFrame);
+				expect(term.getScrollBuffer().join("\n")).not.toContain("preview-");
+				expect(tui.refreshNativeScrollbackIfDirty()).toBe(false);
 			} finally {
 				tui.stop();
 			}
@@ -1201,6 +2211,263 @@ describe("TUI terminal-state regressions", () => {
 				tui.stop();
 			}
 		});
+		it("defers bottom-anchored shrink when POSIX viewport state is unknown", async () => {
+			// Repro for #1566 follow-up (kitty/Linux): a bottom-anchored shrink across the
+			// viewport boundary used to fall through to `viewportRepaint`, which redrew the
+			// new transcript at `newLength - height` while leaving rows
+			// `[newLength - height .. prevLength - height - 1]` already in native
+			// scrollback — they reappeared at the top of the viewport, duplicating two rows
+			// at the boundary in the captured trace.
+			const term = new UnknownViewportTerminal(40, 6);
+			const tui = new TUI(term);
+			const body = rows("line-", 12);
+			const component = new MutableLinesComponent([...body, "spinner-row", "spacer-row", "prompt-row"]);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				component.setLines([...body, "prompt-row"]);
+				tui.requestRender();
+				await settle(term);
+
+				const scrollback = term.getScrollBuffer();
+				for (let i = 0; i < body.length; i++) {
+					const pattern = new RegExp(`\\bline-${i}\\b`);
+					expect(
+						countMatches(scrollback, pattern),
+						`line-${i} must not duplicate at boundary`,
+					).toBeLessThanOrEqual(1);
+				}
+
+				expect(tui.refreshNativeScrollbackIfDirty({ allowUnknownViewport: true })).toBe(false);
+				await settle(term);
+				const stillDeferred = term.getScrollBuffer();
+				for (let i = 0; i < body.length; i++) {
+					const pattern = new RegExp(`\\bline-${i}\\b`);
+					expect(
+						countMatches(stillDeferred, pattern),
+						`line-${i} remains non-duplicated while deferred`,
+					).toBeLessThanOrEqual(1);
+				}
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("repaints only the active-grid bottom row while unknown viewport mutation is deferred", async () => {
+			const initial = [...rows("line-", 12), "spinner-a"];
+			const updated = ["edited-0", ...rows("line-", 12).slice(1), "spinner-b"];
+
+			await withTerminalRisk(true, async () => {
+				const term = new UnknownViewportTerminal(40, 6);
+				const tui = new TUI(term);
+				const component = new MutableLinesComponent(initial);
+				tui.addChild(component);
+
+				try {
+					tui.start();
+					await settle(term);
+					const writes = captureWrites(term);
+
+					component.setLines(updated);
+					tui.requestRender();
+					await settle(term);
+
+					const viewport = visible(term).map(line => line.trim());
+					expect(viewport.at(-1)).toBe("spinner-b");
+					expect(term.getScrollBuffer().join("\n")).not.toContain("edited-0");
+					const paint = writes.at(-1) ?? "";
+					expect(paint).toContain("\rspinner-b\x1b[0m\x1b[K");
+					expect(paint).not.toContain("\x1b[H");
+					expect(paint).not.toContain("\x1b[3J");
+				} finally {
+					tui.stop();
+				}
+
+				const scrolledTerm = new UnknownViewportTerminal(40, 6);
+				const scrolledTui = new TUI(scrolledTerm);
+				const scrolledComponent = new MutableLinesComponent(initial);
+				scrolledTui.addChild(scrolledComponent);
+
+				try {
+					scrolledTui.start();
+					await settle(scrolledTerm);
+					scrolledTerm.scrollLines(-1);
+					const before = scrolledTerm.getBufferPosition();
+					const beforeViewport = visible(scrolledTerm).map(line => line.trim());
+					const writes = captureWrites(scrolledTerm);
+
+					scrolledComponent.setLines(updated);
+					scrolledTui.requestRender();
+					await settle(scrolledTerm);
+
+					expect(scrolledTerm.getBufferPosition()).toEqual(before);
+					expect(visible(scrolledTerm).map(line => line.trim())).toEqual(beforeViewport);
+					expect(scrolledTerm.getScrollBuffer().join("\n")).not.toContain("edited-0");
+					const paint = writes.at(-1) ?? "";
+					expect(paint).toContain("\rspinner-b\x1b[0m\x1b[K");
+					expect(paint).not.toContain("\x1b[H");
+					expect(paint).not.toContain("\x1b[3J");
+				} finally {
+					scrolledTui.stop();
+				}
+			});
+		});
+		it("rebuilds history when a shrink leaves no real rows above the scrollback boundary", async () => {
+			// Reviewer scenario (#1599): a large completion-style collapse (e.g. a 100-row
+			// streamed transcript shrinking to a 20-row final cell in a 10-row viewport)
+			// must NOT use the padded `deferredShrink` — the viewport would fall entirely
+			// past the end of `newLines` and render as all blanks (no prompt visible) until
+			// the next checkpoint. Yank the scrollback instead so the new tail stays on
+			// screen.
+			const term = new UnknownViewportTerminal(40, 10);
+			const tui = new TUI(term);
+			const body = rows("line-", 99);
+			const component = new MutableLinesComponent([...body, "prompt-row"]);
+			tui.addChild(component);
+			const savedTerminalRisk = TERMINAL.eagerEraseScrollbackRisk;
+			mutableTerminalInfo.eagerEraseScrollbackRisk = false;
+
+			try {
+				tui.start();
+				await settle(term);
+
+				const short = rows("short-", 19);
+				component.setLines([...short, "prompt-row"]);
+				tui.requestRender();
+				await settle(term);
+
+				const viewport = visible(term).map(line => line.trim());
+				expect(viewport).toEqual([
+					"short-10",
+					"short-11",
+					"short-12",
+					"short-13",
+					"short-14",
+					"short-15",
+					"short-16",
+					"short-17",
+					"short-18",
+					"prompt-row",
+				]);
+				const scrollback = term.getScrollBuffer();
+				for (let i = 0; i < short.length; i++) {
+					const pattern = new RegExp(`\\bshort-${i}\\b`);
+					expect(countMatches(scrollback, pattern), `short-${i} appears once`).toBe(1);
+				}
+				expect(scrollback.join("\n")).not.toContain("line-");
+			} finally {
+				mutableTerminalInfo.eagerEraseScrollbackRisk = savedTerminalRisk;
+				tui.stop();
+			}
+		});
+
+		it("defers ED3-risk huge shrink while unknown viewport is scrolled", async () => {
+			// The huge-shrink fallback normally prefers `historyRebuild` over a blank
+			// padded viewport. On terminals where ED3 can move an unobservable
+			// scrollback viewport, that fallback is worse: it yanks the reader to the
+			// top. Keep the old visible history frozen and rebuild only at checkpoint.
+			const originalPlatform = process.platform;
+			Object.defineProperty(process, "platform", { configurable: true, value: "linux" });
+			try {
+				await withTerminalRisk(true, async () => {
+					const term = new UnknownViewportTerminal(40, 10);
+					const tui = new TUI(term);
+					const body = rows("line-", 99);
+					const component = new MutableLinesComponent([...body, "prompt-row"]);
+					tui.addChild(component);
+
+					try {
+						tui.start();
+						await settle(term);
+						term.scrollLines(-2);
+						const before = term.getBufferPosition();
+						const beforeViewport = visible(term).map(line => line.trim());
+						expect(before.viewportY).toBeGreaterThan(0);
+
+						const short = rows("short-", 19);
+						component.setLines([...short, "prompt-row"]);
+						tui.requestRender();
+						await settle(term);
+
+						const after = term.getBufferPosition();
+						expect(after.viewportY).toBe(before.viewportY);
+						expect(visible(term).map(line => line.trim())).toEqual(beforeViewport);
+						expect(term.getScrollBuffer().join("\n")).not.toContain("short-");
+
+						term.scrollLines(999);
+						expect(tui.refreshNativeScrollbackIfDirty({ allowUnknownViewport: true })).toBe(false);
+						await settle(term);
+						expect(term.getScrollBuffer().join("\n")).not.toContain("short-");
+					} finally {
+						tui.stop();
+					}
+				});
+			} finally {
+				Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
+			}
+		});
+		it("rebuilds history when prior POSIX repaint left the padded viewport past the new tail", async () => {
+			const term = new UnknownViewportTerminal(40, 10);
+			const tui = new TUI(term);
+			const initial = rows("line-", 19);
+			const component = new MutableLinesComponent([...initial, "prompt-row"]);
+			tui.addChild(component);
+			const savedTerminalRisk = TERMINAL.eagerEraseScrollbackRisk;
+			mutableTerminalInfo.eagerEraseScrollbackRisk = false;
+
+			try {
+				tui.start();
+				await settle(term);
+
+				// Unknown-POSIX offscreen mutation: repainting the viewport commits the
+				// 120-row logical frame, but `#emitViewportRepaint` intentionally does not
+				// advance `#scrollbackHighWater` (it remains at the original 20-row frame's
+				// 10-row overflow). The later shrink must compare against the padded viewport
+				// top (`120 - height`) rather than the stale high-water mark.
+				const expanded = ["edited-line", ...rows("line-", 118), "prompt-row"];
+				component.setLines(expanded);
+				tui.requestRender();
+				await settle(term);
+				expect(visible(term).map(line => line.trim())).toEqual([
+					"line-109",
+					"line-110",
+					"line-111",
+					"line-112",
+					"line-113",
+					"line-114",
+					"line-115",
+					"line-116",
+					"line-117",
+					"prompt-row",
+				]);
+
+				const short = [...rows("short-", 14), "prompt-row"];
+				component.setLines(short);
+				tui.requestRender();
+				await settle(term);
+
+				expect(visible(term).map(line => line.trim())).toEqual([
+					"short-5",
+					"short-6",
+					"short-7",
+					"short-8",
+					"short-9",
+					"short-10",
+					"short-11",
+					"short-12",
+					"short-13",
+					"prompt-row",
+				]);
+				expect(term.getScrollBuffer().join("\n")).not.toContain("line-");
+			} finally {
+				mutableTerminalInfo.eagerEraseScrollbackRisk = savedTerminalRisk;
+				tui.stop();
+			}
+		});
+
 		it("renders streaming row inserts on WSL Windows Terminal even when viewport probe is unavailable", async () => {
 			const originalPlatform = process.platform;
 			Object.defineProperty(process, "platform", { configurable: true, value: "linux" });
@@ -1255,6 +2522,423 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 
+		it("keeps a scrolled-up reader anchored while streaming inserts arrive on POSIX (unknown viewport)", async () => {
+			// POSIX terminals cannot report scrollback position, so isNativeViewportAtBottom()
+			// is undefined. Before the fix the planner optimistically treated "unknown" as
+			// "at bottom" and rebuilt native scrollback (clear + replay) on every offscreen
+			// streaming insert, wiping history and yanking a scrolled-up reader to the tail.
+			const originalPlatform = process.platform;
+			Object.defineProperty(process, "platform", { configurable: true, value: "linux" });
+			try {
+				await withEnvPatch({ TMUX: undefined, STY: undefined, ZELLIJ: undefined }, async () => {
+					const term = new UnknownViewportTerminal(32, 5);
+					const tui = new TUI(term);
+					// Assistant transcript that already overflows into scrollback, pinned footer below.
+					const transcript = new MutableLinesComponent(rows("seed-", 12));
+					const footer = new MutableLinesComponent(["prompt>"]);
+					tui.addChild(transcript);
+					tui.addChild(footer);
+
+					try {
+						tui.start();
+						await settle(term);
+
+						// Reader scrolls up into history.
+						term.scrollLines(-4);
+						const before = term.getBufferPosition();
+						const anchored = visible(term).map(line => line.trim());
+						expect(before.viewportY).toBeGreaterThan(0);
+						expect(before.viewportY).toBeLessThan(before.baseY);
+
+						// Stream rows above the footer — the real coding-agent shape. Each frame is a
+						// length-changing insert that previously routed to a destructive historyRebuild.
+						for (let i = 0; i < 4; i++) {
+							transcript.setLines([...rows("seed-", 12), ...rows("token-", i + 1)]);
+							tui.requestRender();
+							await settle(term);
+
+							const pos = term.getBufferPosition();
+							// Still scrolled up (not snapped to the tail) and reading the same rows.
+							expect(pos.viewportY).toBeLessThan(pos.baseY);
+							expect(visible(term).map(line => line.trim())).toEqual(anchored);
+						}
+
+						// The incremental diff path streamed the tail straight into native
+						// scrollback without a destructive rebuild: earliest history survives and
+						// the live tail is reachable once the reader returns to the bottom.
+						expect(term.getScrollBuffer().join("\n")).toContain("seed-0");
+						expect(term.getScrollBuffer().join("\n")).toContain("token-3");
+
+						// An offscreen reflow (edit above the fold) must defer rather than rebuild,
+						// so the reader is still not yanked; the deferred rewrite is marked dirty.
+						transcript.setLines(["seed-EDIT", ...rows("seed-", 12).slice(1), ...rows("token-", 4)]);
+						tui.requestRender();
+						await settle(term);
+						const offscreenPos = term.getBufferPosition();
+						expect(offscreenPos.viewportY).toBeLessThan(offscreenPos.baseY);
+						expect(visible(term).map(line => line.trim())).toEqual(anchored);
+
+						// Unknown viewport checkpoints stay non-destructive; the dirty rewrite
+						// waits for a positive at-tail proof instead of assuming prompt submit
+						// makes host scrollback safe.
+						term.scrollLines(999);
+						expect(tui.refreshNativeScrollbackIfDirty({ allowUnknownViewport: true })).toBe(false);
+						await settle(term);
+						expect(term.getScrollBuffer().join("\n")).not.toContain("seed-EDIT");
+					} finally {
+						tui.stop();
+					}
+				});
+			} finally {
+				Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
+			}
+		});
+
+		it("does not trust a single stale at-bottom probe for live rebuilds", async () => {
+			const originalPlatform = process.platform;
+			Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+			try {
+				await withEnvPatch(
+					{ TMUX: undefined, STY: undefined, ZELLIJ: undefined, WT_SESSION: undefined },
+					async () => {
+						const term = new StaleBottomViewportTerminal(32, 5, 200);
+						const tui = new TUI(term);
+						const component = new MutableLinesComponent(rows("seed-", 12));
+						tui.addChild(component);
+
+						try {
+							tui.start();
+							await settle(term);
+							expect(term.isNativeViewportAtBottom()).toBe(true);
+
+							term.scrollLines(-4);
+							const before = term.getBufferPosition();
+							const anchored = visible(term).map(line => line.trim());
+							expect(before.viewportY).toBeLessThan(before.baseY);
+
+							component.setLines(["seed-EDIT", ...rows("seed-", 12).slice(1), ...rows("tail-", 4)]);
+							tui.requestRender();
+							await settle(term);
+
+							const after = term.getBufferPosition();
+							expect(after.viewportY).toBe(before.viewportY);
+							expect(visible(term).map(line => line.trim())).toEqual(anchored);
+						} finally {
+							tui.stop();
+						}
+					},
+				);
+			} finally {
+				Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
+			}
+		});
+		it("keeps scroll-off rows reachable when a streaming block re-lays-out past the viewport (ED3-risk, unknown viewport)", async () => {
+			// Regression: a stable-prefix scrollback experiment withheld a live block's
+			// overflow from native history whenever a frame rewrote a row in the
+			// scroll-off band [prevViewportTop, overflowRows) — exactly what a streaming
+			// markdown/plan block does as it re-wraps while growing. Those rows then
+			// scrolled above the bottom-anchored viewport without ever being committed,
+			// so they were neither in scrollback nor on screen: a large response showed
+			// "only half" until a resize forced a full rebuild. Rows that scroll off the
+			// viewport MUST reach native scrollback so the reader can scroll up to them,
+			// and the commit must stay non-destructive (no ED3 saved-lines erase).
+			const originalPlatform = process.platform;
+			Object.defineProperty(process, "platform", { configurable: true, value: "linux" });
+			try {
+				await withEnvPatch({ TMUX: undefined, STY: undefined, ZELLIJ: undefined }, async () => {
+					await withTerminalRisk(true, async () => {
+						const height = 8;
+						const term = new UnknownViewportTerminal(50, height, 500);
+						const writes = captureWrites(term);
+						const tui = new TUI(term);
+						// Reader follows the live tail (bottom-anchored, never scrolled up).
+						const transcript = new MutableLinesComponent(["intro", ...rows("row-", 18)]);
+						const footer = new MutableLinesComponent(["status", "prompt>"]);
+						tui.addChild(transcript);
+						tui.addChild(footer);
+
+						try {
+							tui.start();
+							await settle(term);
+
+							// prevLen = 1 + 18 + 2 = 21, height = 8 -> prevViewportTop = 13.
+							// Append 6 rows (newLen = 27 -> overflowRows = 19) and, in the SAME
+							// frame, re-lay-out logical row 14 ("row-13"), which sits inside the
+							// scroll-off band [13, 19) and is about to leave the viewport.
+							const reflowed = rows("row-", 18).map((row, i) => (i === 13 ? `${row}-reflowed` : row));
+							const grown = ["intro", ...reflowed, ...rows("row-", 24).slice(18)];
+							transcript.setLines(grown);
+							tui.requestRender();
+							await settle(term);
+
+							// Bottom-anchored on the live tail.
+							expect(visible(term).map(line => line.trim())).toEqual([
+								"row-18",
+								"row-19",
+								"row-20",
+								"row-21",
+								"row-22",
+								"row-23",
+								"status",
+								"prompt>",
+							]);
+
+							// Every logical row is reachable through native scrollback ∪ viewport.
+							const baseY = term.getBufferPosition().baseY;
+							const history = term
+								.getScrollBuffer()
+								.slice(0, baseY)
+								.map(line => line.trimEnd());
+							const reachable = new Set([...history, ...visible(term)].map(line => line.trim()));
+							for (const row of grown) {
+								expect(reachable.has(row), `${row} must stay reachable`).toBe(true);
+							}
+
+							// The scrolled-off rows — including the in-band re-laid-out one — landed
+							// in committed native history, not just the active grid.
+							expect(history).toContain("row-13-reflowed");
+							expect(history).toContain("row-12");
+							expect(history).toContain("row-17");
+
+							// Anti-yank guarantee preserved: no destructive saved-lines erase.
+							expect(writes.join("")).not.toContain("\x1b[3J");
+						} finally {
+							tui.stop();
+						}
+					});
+				});
+			} finally {
+				Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
+			}
+		});
+		it("keeps offscreen streaming growth incremental when the viewport is unknown", async () => {
+			// Unknown viewport probes are not proof that the user is at the tail. While
+			// a foreground tool is active, same-size/growing offscreen edits must keep
+			// using append/repaint primitives instead of clearing scrollback once per
+			// streaming tick after the transcript fills the viewport.
+			const originalPlatform = process.platform;
+			Object.defineProperty(process, "platform", { configurable: true, value: "linux" });
+			try {
+				await withEnvPatch(
+					{
+						TMUX: undefined,
+						STY: undefined,
+						ZELLIJ: undefined,
+						WEZTERM_PANE: undefined,
+						KITTY_WINDOW_ID: undefined,
+						GHOSTTY_RESOURCES_DIR: undefined,
+						ALACRITTY_WINDOW_ID: undefined,
+						TERM_PROGRAM: undefined,
+					},
+					async () => {
+						const term = new UnknownViewportTerminal(40, 5, 200);
+						const tui = new TUI(term);
+						const component = new MutableLinesComponent(rows("row-", 16));
+						tui.addChild(component);
+						const savedTerminalRisk = TERMINAL.eagerEraseScrollbackRisk;
+						mutableTerminalInfo.eagerEraseScrollbackRisk = false;
+
+						try {
+							tui.start();
+							await settle(term);
+							const writes = captureWrites(term);
+							tui.setEagerNativeScrollbackRebuild(true);
+
+							// A streaming tool result re-laying out: an offscreen header changes and the
+							// block grows past the fold in the same frame.
+							component.setLines(["HEADER-EDITED", ...rows("row-", 16).slice(1), ...rows("tail-", 4)]);
+							tui.requestRender();
+							await settle(term);
+
+							const output = writes.join("");
+							expect(output).not.toContain("\x1b[2J");
+							expect(output).not.toContain("\x1b[3J");
+							const buffer = term.getScrollBuffer().map(line => line.trimEnd());
+							expect(buffer).toContain("row-0");
+							expect(buffer).toContain("tail-3");
+							expect(buffer).not.toContain("HEADER-EDITED");
+							expect(tui.refreshNativeScrollbackIfDirty({ allowUnknownViewport: true })).toBe(false);
+						} finally {
+							mutableTerminalInfo.eagerEraseScrollbackRisk = savedTerminalRisk;
+							tui.stop();
+						}
+					},
+				);
+			} finally {
+				Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
+			}
+		});
+
+		it("paints a viewport-saturating pure-append on native Windows Terminal (no \\x1b[3J)", async () => {
+			// Regression: on native Windows the viewport probe is permanently
+			// `undefined` (ProcessTerminal does not implement it — see #1635/#1746). The
+			// `15.7.5` #1635 fix routed pure-append-over-saturated-viewport frames to
+			// `deferredMutation` here, which is a literal no-op. That froze the editor
+			// on the very keystroke that grows `lines.length` past the viewport (the
+			// wrap keystroke) until the next prompt-submit checkpoint flushed.
+			const originalPlatform = process.platform;
+			Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+			try {
+				await withEnvPatch(
+					{ WT_SESSION: "wt-test", TMUX: undefined, STY: undefined, ZELLIJ: undefined },
+					async () => {
+						const term = new UnknownViewportTerminal(32, 5);
+						const tui = new TUI(term);
+						// Five-row transcript + one editor row saturates the viewport (height = 5).
+						// The user is at the tail — no scroll — but the probe still answers `undefined`.
+						const transcript = new MutableLinesComponent(rows("seed-", 5));
+						const editor = new MutableLinesComponent(["prompt> a"]);
+						tui.addChild(transcript);
+						tui.addChild(editor);
+
+						try {
+							tui.start();
+							await settle(term);
+
+							const writes: string[] = [];
+							const realWrite = term.write.bind(term);
+							(term as unknown as { write: (s: string) => void }).write = (data: string) => {
+								writes.push(data);
+								realWrite(data);
+							};
+
+							// The wrap keystroke: editor grows from one to two visual rows. This is a
+							// pure append (`firstChanged === previousLines.length`, content grew) over
+							// a viewport already at capacity — exactly the branch that used to defer.
+							editor.setLines(["prompt> a", "wrap-row"]);
+							tui.requestRender();
+							await settle(term);
+
+							// The #1635 anti-yank guarantee must survive: no destructive scrollback erase.
+							expect(writes.join("")).not.toContain("\x1b[3J");
+							// The wrap row paints in the same frame — viewportRepaint is non-destructive
+							// but writes the visible window, so the editor's new visual row is on screen.
+							expect(visible(term).map(line => line.trim())).toContain("wrap-row");
+							// Unknown viewport checkpoint remains non-destructive.
+							expect(tui.refreshNativeScrollbackIfDirty({ allowUnknownViewport: true })).toBe(false);
+						} finally {
+							tui.stop();
+						}
+					},
+				);
+			} finally {
+				Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
+			}
+		});
+
+		it("paints a slash-command-shaped structural mutation on native Windows Terminal (no \\x1b[3J)", async () => {
+			// Sibling regression: `/plan`, `/resume`, model switches, role-badge flips,
+			// status-line toggles — any structural offscreen mutation — also routed to
+			// `deferredMutation` under WT, so the toggle never painted until the next
+			// checkpoint. After the fix the planner falls back to `viewportRepaint`
+			// instead, painting the visible window without emitting `\x1b[3J`.
+			const originalPlatform = process.platform;
+			Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+			try {
+				await withEnvPatch(
+					{ WT_SESSION: "wt-test", TMUX: undefined, STY: undefined, ZELLIJ: undefined },
+					async () => {
+						const term = new UnknownViewportTerminal(32, 5);
+						const tui = new TUI(term);
+						// Transcript + status + prompt; total six rows over a five-row viewport.
+						const transcript = new MutableLinesComponent(rows("seed-", 4));
+						const status = new MutableLinesComponent(["STATUS-OLD"]);
+						const prompt = new MutableLinesComponent(["prompt>"]);
+						tui.addChild(transcript);
+						tui.addChild(status);
+						tui.addChild(prompt);
+
+						try {
+							tui.start();
+							await settle(term);
+
+							const writes: string[] = [];
+							const realWrite = term.write.bind(term);
+							(term as unknown as { write: (s: string) => void }).write = (data: string) => {
+								writes.push(data);
+								realWrite(data);
+							};
+
+							// Slash-command toggle: an existing offscreen row flips its content and a
+							// new chrome row is inserted. firstChanged lands above the viewport top,
+							// length grew by one — a structural mutation, not a pure append.
+							status.setLines(["STATUS-NEW", "EXTRA"]);
+							tui.requestRender();
+							await settle(term);
+
+							expect(writes.join("")).not.toContain("\x1b[3J");
+							const view = visible(term).map(line => line.trim());
+							expect(view).toContain("STATUS-NEW");
+							expect(view).toContain("EXTRA");
+							expect(tui.refreshNativeScrollbackIfDirty({ allowUnknownViewport: true })).toBe(false);
+						} finally {
+							tui.stop();
+						}
+					},
+				);
+			} finally {
+				Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
+			}
+		});
+
+		it("still defers when the native viewport probe confirms a scrolled-up reader", async () => {
+			// Counterpart to the two paints above: when the probe is *reliable* and reports
+			// `false`, the reader is parked in scrollback and a live-frame write is wasted.
+			// `deferredMutation` (a no-op) must stay in place so the next checkpoint can
+			// reconcile cleanly, and no bytes hit the terminal during the deferred frame.
+			const originalPlatform = process.platform;
+			Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+			try {
+				await withEnvPatch(
+					{ WT_SESSION: undefined, TMUX: undefined, STY: undefined, ZELLIJ: undefined },
+					async () => {
+						const term = new VirtualTerminal(32, 5);
+						const tui = new TUI(term);
+						const transcript = new MutableLinesComponent(rows("seed-", 5));
+						const status = new MutableLinesComponent(["STATUS-OLD"]);
+						const prompt = new MutableLinesComponent(["prompt>"]);
+						tui.addChild(transcript);
+						tui.addChild(status);
+						tui.addChild(prompt);
+
+						try {
+							tui.start();
+							await settle(term);
+
+							// Pin the probe to a confirmed-scrolled answer (host reports `false`).
+							(term as unknown as { isNativeViewportAtBottom: () => boolean }).isNativeViewportAtBottom = () =>
+								false;
+
+							const writes: string[] = [];
+							const realWrite = term.write.bind(term);
+							(term as unknown as { write: (s: string) => void }).write = (data: string) => {
+								writes.push(data);
+								realWrite(data);
+							};
+
+							// Same structural mutation as the slash-command test — but with the probe
+							// telling us the user can't see the live frame, the planner stays a no-op.
+							status.setLines(["STATUS-NEW", "EXTRA"]);
+							tui.requestRender();
+							await settle(term);
+
+							// Zero bytes written — the deferral is intentional and protects the reader.
+							expect(writes.join("")).toBe("");
+							// Scrollback was marked dirty by the deferral; once the reader returns to
+							// the tail (probe reports `true`) the next checkpoint reconciles cleanly.
+							(term as unknown as { isNativeViewportAtBottom: () => boolean }).isNativeViewportAtBottom = () =>
+								true;
+							expect(tui.refreshNativeScrollbackIfDirty()).toBe(true);
+						} finally {
+							tui.stop();
+						}
+					},
+				);
+			} finally {
+				Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
+			}
+		});
+
 		it("refreshes deferred native scrollback when the native viewport reaches bottom", async () => {
 			const term = new VirtualTerminal(32, 5);
 			const tui = new TUI(term);
@@ -1283,7 +2967,7 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 
-		it("refreshes dirty native scrollback before transient checkpoint rows render", async () => {
+		it("keeps transient checkpoint rows out of clean rebuilt scrollback", async () => {
 			const term = new VirtualTerminal(32, 5);
 			const tui = new TUI(term);
 			const chat = new MutableLinesComponent(rows("line-", 12));
@@ -1302,7 +2986,7 @@ describe("TUI terminal-state regressions", () => {
 				await settle(term);
 				term.scrollLines(999);
 
-				expect(tui.refreshNativeScrollbackIfDirty()).toBe(true);
+				expect(tui.refreshNativeScrollbackIfDirty()).toBe(false);
 				status.setLines(["LOADER"]);
 				tui.requestRender();
 				await settle(term);
@@ -1318,13 +3002,11 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 
-		it("tail-cell mutation is cleaned up at the next native scrollback checkpoint", async () => {
-			// Repro for the old scrollback-duplication bug: once a header
-			// (e.g. the welcome screen) has scrolled into terminal history, the
-			// last tool cell mutating (grow/shrink cycles, completion collapse)
-			// makes native scrollback stale. Live frames now defer the destructive
-			// clear+replay until a user-run checkpoint rather than yanking users who
-			// are reading scrollback mid-stream.
+		it("tail-cell mutation is cleaned up before the next native scrollback checkpoint", async () => {
+			// Once a header has scrolled into terminal history, a bottom-anchored
+			// tail cell shrink must rebuild immediately. Deferring until the next
+			// checkpoint leaves stale high-water rows above the viewport and duplicates
+			// retained header/tail rows when users scroll back.
 			const term = new VirtualTerminal(40, 10);
 			const tui = new TUI(term);
 			const header = new MutableLinesComponent(["HEADER-0", "HEADER-1", "HEADER-2", "HEADER-3", "HEADER-4"]);
@@ -1360,15 +3042,14 @@ describe("TUI terminal-state regressions", () => {
 					await settle(term);
 				}
 
-				// Final completion-style collapse: full transcript fits in the
-				// viewport again, even though scrollback already holds an
-				// earlier copy of HEADER. Rebuild at the next checkpoint to clean the
-				// stale native history.
+				// Final completion-style collapse: the rebuild happens on this render
+				// while the viewport is bottom-anchored, so the checkpoint below should
+				// have no dirty native scrollback left to repair.
 				tail.setLines(["[completed: many lines]", "[footer]"]);
 				tui.requestRender();
 				await settle(term);
 				term.scrollLines(999);
-				expect(tui.refreshNativeScrollbackIfDirty()).toBe(true);
+				expect(tui.refreshNativeScrollbackIfDirty()).toBe(false);
 				await settle(term);
 				const scrollback = term.getScrollBuffer();
 				for (let i = 0; i < 5; i++) {
@@ -1467,6 +3148,27 @@ describe("TUI terminal-state regressions", () => {
 				tui.stop();
 			}
 		});
+
+		it("leaves the parent shell prompt directly after short content on stop", async () => {
+			const term = new VirtualTerminal(20, 5);
+			const tui = new TUI(term);
+			let stopped = false;
+			tui.addChild(new MutableLinesComponent(["omp0", "omp1", "omp2"]));
+
+			try {
+				tui.start();
+				await settle(term);
+				tui.stop();
+				stopped = true;
+				await term.flush();
+				term.write("bash$ ");
+				await term.flush();
+
+				expect(visible(term)).toEqual(["omp0", "omp1", "omp2", "bash$", ""]);
+			} finally {
+				if (!stopped) tui.stop();
+			}
+		});
 	});
 
 	describe("overlay compositing", () => {
@@ -1496,6 +3198,149 @@ describe("TUI terminal-state regressions", () => {
 				const viewport = visible(term);
 				expect(viewport[2]?.trim()).toBe("base-2");
 				expect(viewport[3]?.trim()).toBe("base-3");
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("hiding an overlay scrubs sentinel rows leaked into scrollback by resize reflow", async () => {
+			const term = new VirtualTerminal(40, 4, 200);
+			const tui = new TUI(term);
+			tui.addChild(new MutableLinesComponent(rows("base-", 20)));
+
+			try {
+				tui.start();
+				await settle(term);
+
+				const handle = tui.showOverlay(
+					new MutableLinesComponent(["OV_SENTINEL_4_ov4-0-0-0-0-0-0", "ov4-1-0-0-0-0"]),
+					{ row: 2, col: 18 },
+				);
+				await settle(term);
+				term.resize(20, 4);
+				await settle(term);
+
+				expect(term.getScrollBuffer().some(line => line.includes("OV_SENTINEL_4_"))).toBeTrue();
+
+				term.scrollLines(-1);
+				await settle(term);
+				handle.hide();
+				await settle(term);
+
+				expect(term.getScrollBuffer().some(line => line.includes("OV_SENTINEL_4_"))).toBeFalse();
+				expect(visible(term).some(line => line.includes("OV_SENTINEL_4_"))).toBeFalse();
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("tmux overlay hide repaints rows exposed by a shorter base frame", async () => {
+			await withEnvPatch({ TMUX: "1", STY: undefined, ZELLIJ: undefined }, async () => {
+				const term = new UnknownViewportTerminal(40, 3);
+				const tui = new TUI(term);
+				tui.addChild(new MutableLinesComponent(["base-0", "base-1", "base-2"]));
+
+				try {
+					tui.start();
+					await settle(term);
+
+					const handle = tui.showOverlay(new MutableLinesComponent(["OV-0", "OV-1", "OV-2"]), {
+						row: 2,
+						col: 0,
+					});
+					await settle(term);
+					expect(visible(term)).toEqual(["OV-0", "OV-1", "OV-2"]);
+
+					// Root cause: tmux disables destructive history rebuilds, so overlay
+					// removal that shrinks the composite frame must repaint the viewport;
+					// diffing from the old viewport top clears only the overlay suffix.
+					handle.hide();
+					await settle(term);
+
+					expect(visible(term)).toEqual(["base-0", "base-1", "base-2"]);
+				} finally {
+					tui.stop();
+				}
+			});
+		});
+	});
+
+	describe("fullscreen overlay alt-screen", () => {
+		it("enters the alt buffer on show, leaves it on hide, and emits no ED3 while modal", async () => {
+			const term = new VirtualTerminal(40, 8, 200);
+			const writes = captureWrites(term);
+			const tui = new TUI(term);
+			tui.addChild(new MutableLinesComponent(rows("base-", 8)));
+
+			try {
+				tui.start();
+				await settle(term);
+
+				const showFrom = writes.length;
+				const handle = tui.showOverlay(new MutableLinesComponent(["MODAL-0", "MODAL-1"]), {
+					anchor: "bottom-center",
+					width: "100%",
+					maxHeight: "100%",
+					margin: 0,
+					fullscreen: true,
+				});
+				await settle(term);
+
+				const modalWrites = writes.slice(showFrom).join("");
+				// Borrowed the alternate screen buffer …
+				expect(modalWrites).toContain("\x1b[?1049h");
+				// … enabled mouse tracking for click/scroll/hover support …
+				expect(modalWrites).toContain("\x1b[?1000h");
+				expect(modalWrites).toContain("\x1b[?1003h"); // any-motion tracking drives hover
+				expect(modalWrites).toContain("\x1b[?1006h");
+				// … and never erased scrollback (ED3) or otherwise touched the transcript.
+				expect(modalWrites).not.toContain("\x1b[3J");
+				expect(visible(term).some(line => line.includes("MODAL-0"))).toBeTrue();
+
+				const hideFrom = writes.length;
+				handle.hide();
+				await settle(term);
+
+				const hideWrites = writes.slice(hideFrom).join("");
+				expect(hideWrites).toContain("\x1b[?1049l");
+				// Mouse tracking is disabled again so the rest of the app keeps native
+				// terminal selection.
+				expect(hideWrites).toContain("\x1b[?1003l"); // motion tracking torn down too
+				expect(hideWrites).toContain("\x1b[?1000l");
+				// Transcript is back on the normal screen after leaving the alt buffer.
+				expect(visible(term).some(line => line.includes("base-"))).toBeTrue();
+				expect(visible(term).some(line => line.includes("MODAL-0"))).toBeFalse();
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("leaves native scrollback untouched across the modal lifetime", async () => {
+			const term = new VirtualTerminal(40, 6, 200);
+			const tui = new TUI(term);
+			// Base transcript overflows the viewport, so rows land in scrollback.
+			tui.addChild(new MutableLinesComponent(rows("base-", 24)));
+
+			try {
+				tui.start();
+				await settle(term);
+				const scrollbackBefore = term.getScrollBuffer().map(line => line.trimEnd());
+
+				const handle = tui.showOverlay(new MutableLinesComponent(["MODAL"]), {
+					anchor: "bottom-center",
+					width: "100%",
+					maxHeight: "100%",
+					margin: 0,
+					fullscreen: true,
+				});
+				await settle(term);
+				handle.hide();
+				await settle(term);
+
+				// The modal borrowed/returned the alt buffer without rewriting the
+				// normal screen's scrollback — the transcript a reader scrolled up to
+				// see is identical before and after.
+				expect(term.getScrollBuffer().map(line => line.trimEnd())).toEqual(scrollbackBefore);
 			} finally {
 				tui.stop();
 			}
@@ -1531,6 +3376,433 @@ describe("TUI terminal-state regressions", () => {
 			}
 		});
 	});
+
+	describe("ZWJ grapheme row containment", () => {
+		// Ghostty agrees with the renderer for this family sequence, so these
+		// regressions no longer use xterm's legacy width tables as the terminal
+		// model. They still pin the row-accounting boundary that used to corrupt
+		// scrollback when a terminal measured a grapheme wider than the renderer:
+		// content writes are wrapped in DECAWM-off (\x1b[?7l), so any future
+		// terminal-side overrun must be contained to the row instead of wrapping
+		// into a phantom spill row.
+		const ZWJ_FAMILY = "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}";
+
+		// MutableLinesComponent pre-slices by UTF-16 code units, which would cut the
+		// ZWJ sequence before the renderer ever measures it. Width decisions must be
+		// made by the renderer's own #fitLineToWidth, so pass lines through raw.
+		class RawLinesComponent implements Component {
+			#lines: string[];
+			constructor(lines: string[]) {
+				this.#lines = [...lines];
+			}
+			setLines(lines: string[]): void {
+				this.#lines = [...lines];
+			}
+			invalidate(): void {}
+			render(): string[] {
+				return [...this.#lines];
+			}
+		}
+
+		it("keeps ZWJ boundary rows on one terminal row; row accounting stays exact", async () => {
+			const width = 20;
+			const height = 6;
+			const term = new VirtualTerminal(width, height);
+			const tui = new TUI(term);
+			// Renderer and Ghostty both fit 18 ASCII + the ZWJ family into this
+			// row. If either side drifts wider, DECAWM-off containment must still
+			// prevent a wrap into the following logical row.
+			const zwjRow = `${"B".repeat(18)}${ZWJ_FAMILY}`;
+			const lines = ["header", zwjRow, "tail"];
+			const component = new RawLinesComponent(lines);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				// One terminal row per logical line — the boundary row did not wrap.
+				expect(term.getScrollBuffer().length).toBe(height);
+				const viewport = visible(term);
+				expect(viewport[0]).toBe("header");
+				expect(viewport[2]).toBe("tail");
+				expect(viewport[1]?.startsWith("B".repeat(18))).toBe(true);
+				expect(viewport[3]).toBe("");
+
+				// Push content into scrollback: accounting must track logical rows
+				// exactly with the ZWJ boundary row in history.
+				const appended = [...lines, ...rows("after-", 10)];
+				component.setLines(appended);
+				tui.requestRender();
+				await settle(term);
+
+				const buffer = term.getScrollBuffer().map(line => line.trimEnd());
+				expect(buffer.length).toBe(appended.length);
+				expect(buffer[0]).toBe("header");
+				expect(buffer[2]).toBe("tail");
+				expect(buffer[buffer.length - 1]).toBe("after-9");
+				// The ZWJ row exists exactly once — no duplicate, no spill row.
+				expect(countMatches(buffer, /^B{18}/)).toBe(1);
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("keeps differential row targeting exact after rendering a ZWJ boundary row", async () => {
+			const width = 20;
+			const height = 8;
+			const term = new VirtualTerminal(width, height);
+			const tui = new TUI(term);
+			const zwjRow = `${"B".repeat(18)}${ZWJ_FAMILY}`;
+			const lines = ["row-0", zwjRow, "row-2", "row-3", "row-4"];
+			const component = new RawLinesComponent(lines);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				// Diff-edit the row below the clipped row. If clipping had desynced the
+				// renderer's hardware-cursor row tracking, this write would land on the
+				// wrong terminal row.
+				component.setLines(["row-0", zwjRow, "EDITED", "row-3", "row-4"]);
+				tui.requestRender();
+				await settle(term);
+
+				const viewport = visible(term);
+				expect(viewport[0]).toBe("row-0");
+				expect(viewport[2]).toBe("EDITED");
+				expect(viewport[3]).toBe("row-3");
+				expect(viewport[4]).toBe("row-4");
+				// Neighbor above the edit (the clipped row) was not rewritten or moved.
+				expect(viewport[1]?.startsWith("B".repeat(18))).toBe(true);
+				expect(term.getScrollBuffer().length).toBe(height);
+			} finally {
+				tui.stop();
+			}
+		});
+	});
+
+	describe("Ghostty-backed renderer/terminal agreement", () => {
+		// Counterpart of the disagreement tests above: VirtualTerminal is backed by
+		// Ghostty's grapheme-aware engine, so its terminal cell widths must agree
+		// with the renderer for emoji presentation, VS16, and keycap sequences. An
+		// exact-fit line fills the row with nothing clipped, and the renderer's
+		// truncation boundary lands the last glyph exactly at the right margin.
+
+		// MutableLinesComponent pre-slices by UTF-16 code units; width decisions
+		// must come from the renderer's #fitLineToWidth.
+		class RawLinesComponent implements Component {
+			#lines: string[];
+			constructor(lines: string[]) {
+				this.#lines = [...lines];
+			}
+			setLines(lines: string[]): void {
+				this.#lines = [...lines];
+			}
+			invalidate(): void {}
+			render(): string[] {
+				return [...this.#lines];
+			}
+		}
+
+		it("renders an exact-fit emoji-presentation line without truncation or wrap", async () => {
+			const width = 20;
+			const term = new VirtualTerminal(width, 6);
+			const tui = new TUI(term);
+			// 14 ASCII + ⚠️(2) + 🙂(2) + keycap(2) = 20 cells for both Ghostty's
+			// grapheme-aware terminal and the renderer — an exact fit.
+			const line = `${"a".repeat(14)}\u26A0\uFE0F\u{1F642}1\uFE0F\u20E3`;
+			const component = new RawLinesComponent(["head", line, "tail"]);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				const viewport = term.getViewport();
+				// Cell-exact: the full line survives the round trip on one row.
+				expect(viewport[1]).toBe(line);
+				expect(viewport[0]?.trimEnd()).toBe("head");
+				expect(viewport[2]?.trimEnd()).toBe("tail");
+				// One terminal row per logical row — no wrap from the wide glyphs.
+				expect(term.getScrollBuffer().length).toBe(6);
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("exposes Ghostty legacy-width/xterm-width overrun instead of accepting hidden truncation", () => {
+			const width = 12;
+			const term = new VirtualTerminal(width, 4);
+			const prefix = "012345678";
+			const wide = "\u{1F642}";
+			const sentinel = "sentinel";
+
+			// A legacy/xterm-width oracle that counts 🙂 as 1 would accept this as
+			// a 12-cell exact fit: 9 ASCII + 🙂 + ZZ. Ghostty counts the emoji as
+			// 2 cells, so the second Z overruns the row. Renderer paints run with
+			// DECAWM off; mirror that containment contract directly through
+			// VirtualTerminal instead of reaching into TUI internals.
+			term.write(`\x1b[?7l${prefix}${wide}ZZ\r\n${sentinel}\x1b[?7h`);
+			const viewport = term.getViewport();
+			expect(viewport[0]).toBe(`${prefix}${wide}Z`);
+			expect(viewport[0]).not.toContain("ZZ");
+			expect(viewport[1]).toBe(sentinel);
+			expect(term.getScrollBuffer().length).toBe(4);
+		});
+
+		it("lands the renderer's truncation boundary exactly at the right margin", async () => {
+			const width = 12;
+			const term = new VirtualTerminal(width, 4);
+			const tui = new TUI(term);
+			// Renderer width: 10 ASCII + 2 + 2 + 2 = 16 > 12 → #fitLineToWidth
+			// truncates. The truncated text must occupy exactly 12 Ghostty cells:
+			// 10 ASCII + ⚠️ = 12, with 🙂 dropped whole (never split).
+			const line = `${"x".repeat(10)}\u26A0\uFE0F\u{1F642}1\uFE0F\u20E3`;
+			const nextLine = "after";
+			const component = new RawLinesComponent([line, nextLine]);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				const viewport = term.getViewport();
+				const rendered = viewport[0] ?? "";
+				// The kept prefix is exactly the renderer's 12-cell truncation.
+				expect(rendered).toBe(`${"x".repeat(10)}\u26A0\uFE0F`);
+				// The exact-width row occupies one Ghostty row: the dropped glyphs
+				// neither split nor wrap into the following logical row.
+				expect(viewport[1]?.trimEnd()).toBe(nextLine);
+				expect(term.getScrollBuffer().length).toBe(4);
+			} finally {
+				tui.stop();
+			}
+		});
+	});
+
+	describe("SGR background containment (BCE)", () => {
+		// Components leak unreset SGR (markdown renderers, raw tool output). On
+		// BCE terminals (xterm.js, xterm, VTE, kitty, ...), \x1b[K / \x1b[2K /
+		// \x1b[2J erase cells using the CURRENT background color, so background
+		// state that leaks across a line boundary paints whole phantom-colored
+		// rows — the "random colored blank rows" bug class. The renderer's
+		// per-line terminators (#applyLineResets appending \x1b[0m + OSC8 close to
+		// every row) must confine a component's unreset background to its own row
+		// on every emit path.
+		class RawLinesComponent implements Component {
+			#lines: string[];
+			constructor(lines: string[]) {
+				this.#lines = [...lines];
+			}
+			setLines(lines: string[]): void {
+				this.#lines = [...lines];
+			}
+			invalidate(): void {}
+			render(): string[] {
+				return [...this.#lines];
+			}
+		}
+
+		const UNRESET_BG_ROW = "\x1b[41mRED-BG-NO-RESET";
+		const UNRESET_FG_UNDERLINE_ROW = "\x1b[32;4mGREEN-UNDER-NO-RESET";
+
+		function backgroundRows(term: VirtualTerminal, height: number): number[] {
+			const rows: number[] = [];
+			for (let row = 0; row < height; row++) {
+				if (term.getViewportRowBackgroundColumns(row).length > 0) rows.push(row);
+			}
+			return rows;
+		}
+
+		function foregroundRows(term: VirtualTerminal, height: number): number[] {
+			const rows: number[] = [];
+			for (let row = 0; row < height; row++) {
+				if (term.getViewportRowForegroundColumns(row).length > 0) rows.push(row);
+			}
+			return rows;
+		}
+
+		function underlineRows(term: VirtualTerminal, height: number): number[] {
+			const rows: number[] = [];
+			for (let row = 0; row < height; row++) {
+				if (term.getViewportRowUnderlineColumns(row).length > 0) rows.push(row);
+			}
+			return rows;
+		}
+
+		it("confines an unreset background to its own row across initial, diff, and shrink paints", async () => {
+			const height = 6;
+			const term = new VirtualTerminal(20, height);
+			const tui = new TUI(term);
+			const component = new RawLinesComponent(["plain-0", UNRESET_BG_ROW, "plain-2"]);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				// Initial paint: only the styled row carries background cells.
+				expect(backgroundRows(term, height)).toEqual([1]);
+
+				// Diff path: rewriting the row below clears only after the row reset;
+				// with leaked background, BCE would otherwise paint that row red.
+				component.setLines(["plain-0", UNRESET_BG_ROW, "EDITED-2"]);
+				tui.requestRender();
+				await settle(term);
+				expect(backgroundRows(term, height)).toEqual([1]);
+				expect(visible(term)[2]).toBe("EDITED-2");
+
+				// Shrink path: the cleared trailing row must come back as a
+				// default-background blank, not a red bar.
+				component.setLines(["plain-0", UNRESET_BG_ROW]);
+				tui.requestRender();
+				await settle(term);
+				expect(backgroundRows(term, height)).toEqual([1]);
+				expect(visible(term)[2]).toBe("");
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("confines unreset foreground and underline to their own row", async () => {
+			const height = 6;
+			const term = new VirtualTerminal(24, height);
+			const tui = new TUI(term);
+			const component = new RawLinesComponent(["plain-0", UNRESET_FG_UNDERLINE_ROW, "plain-2"]);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				expect(foregroundRows(term, height)).toEqual([1]);
+				expect(underlineRows(term, height)).toEqual([1]);
+
+				// Rewriting the next row clears only after the row reset; leaked SGR
+				// would make the edited row green/underlined despite containing plain text.
+				component.setLines(["plain-0", UNRESET_FG_UNDERLINE_ROW, "EDITED-2"]);
+				tui.requestRender();
+				await settle(term);
+				expect(foregroundRows(term, height)).toEqual([1]);
+				expect(underlineRows(term, height)).toEqual([1]);
+				expect(term.getViewportRowForegroundColumns(2)).toEqual([]);
+				expect(term.getViewportRowUnderlineColumns(2)).toEqual([]);
+
+				component.setLines(["plain-0", UNRESET_FG_UNDERLINE_ROW]);
+				tui.requestRender();
+				await settle(term);
+				expect(foregroundRows(term, height)).toEqual([1]);
+				expect(underlineRows(term, height)).toEqual([1]);
+				expect(term.getViewportRowForegroundColumns(2)).toEqual([]);
+				expect(term.getViewportRowUnderlineColumns(2)).toEqual([]);
+			} finally {
+				tui.stop();
+			}
+		});
+
+		it("confines an unreset background during full viewport repaints", async () => {
+			const height = 4;
+			const term = new VirtualTerminal(20, height);
+			const tui = new TUI(term);
+			// Content taller than the viewport so repaints exercise the
+			// bottom-anchored slice logic with the styled row offscreen and onscreen.
+			const lines = ["plain-0", UNRESET_BG_ROW, ...rows("tail-", 4)];
+			const component = new RawLinesComponent(lines);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				// Force a full repaint (viewport rewrite path suffix-clears each text row).
+				tui.requestRender(true);
+				await settle(term);
+
+				// The styled row is offscreen (frame rows 2-5 visible); no visible row
+				// may carry background cells.
+				expect(backgroundRows(term, height)).toEqual([]);
+				// And the committed scrollback copy of the styled row keeps its color
+				// confined: the rows after it in history have no background.
+				expect(term.getViewportRowBackgroundColumns(0)).toEqual([]);
+			} finally {
+				tui.stop();
+			}
+		});
+	});
+
+	describe("pending-wrap / DECAWM at exact-width rows", () => {
+		// A row whose visible width EXACTLY equals the terminal width writes its
+		// last cell, latching the "pending wrap" flag on autowrap terminals — a
+		// following cursor move can then wrap to the next row and produce staircase
+		// trails / phantom rows in scrollback. The renderer disables autowrap
+		// (\x1b[?7l) around every paint and restores it (\x1b[?7h) only at PAINT_END,
+		// after emitting explicit CRLFs, so an exact-width row never latches
+		// pending-wrap. These tests pin that with Ghostty-backed ASCII and wide-glyph
+		// rows across the initial, diff, and append emit paths.
+		class RawLinesComponent implements Component {
+			#lines: string[];
+			constructor(lines: string[]) {
+				this.#lines = [...lines];
+			}
+			setLines(lines: string[]): void {
+				this.#lines = [...lines];
+			}
+			invalidate(): void {}
+			render(): string[] {
+				return [...this.#lines];
+			}
+		}
+
+		it("keeps exact-width Ghostty-backed rows on one terminal row without staircase", async () => {
+			const width = 10;
+			const height = 6;
+			const term = new VirtualTerminal(width, height);
+			const tui = new TUI(term);
+			// Two exact-width (10-cell) rows: one ASCII, one ending on 2-cell wide
+			// glyphs exactly at the right margin (the pending-wrap trigger).
+			const exactAscii = "0123456789";
+			const exactWide = "AAAA界界界"; // 4 + 2+2+2 = 10
+			const lines = ["top", exactAscii, exactWide, "bot"];
+			const component = new RawLinesComponent(lines);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+
+				// Each logical row occupies exactly one terminal row — no wrap.
+				// Content (4 rows) fits the 6-row viewport, so the buffer is the
+				// viewport: 4 content rows + 2 trailing blanks, each on its own row.
+				const buffer = term.getScrollBuffer().map(line => line.trimEnd());
+				expect(buffer).toEqual(["top", exactAscii, exactWide, "bot", "", ""]);
+
+				// Diff-edit the row below the exact-width wide row: if pending-wrap
+				// had latched, the relative cursor move would land a row off.
+				component.setLines(["top", exactAscii, exactWide, "EDIT"]);
+				tui.requestRender();
+				await settle(term);
+				expect(term.getViewport().map(line => line.trimEnd())).toEqual([
+					"top",
+					exactAscii,
+					exactWide,
+					"EDIT",
+					"",
+					"",
+				]);
+
+				// Append past the viewport: exact-width rows must scroll into
+				// history one row each, contiguous, no phantom blank from a latched
+				// wrap.
+				component.setLines(["top", exactAscii, exactWide, "EDIT", ...rows("a-", 6)]);
+				tui.requestRender();
+				await settle(term);
+				const after = term.getScrollBuffer().map(line => line.trimEnd());
+				expect(after).toEqual(["top", exactAscii, exactWide, "EDIT", ...rows("a-", 6)]);
+			} finally {
+				tui.stop();
+			}
+		});
+	});
 	describe("hardware cursor preference", () => {
 		const SHOW_CURSOR = "\x1b[?25h";
 
@@ -1539,6 +3811,37 @@ describe("TUI terminal-state regressions", () => {
 			invalidate(): void {}
 			render(_width: number): string[] {
 				return [`prompt>${CURSOR_MARKER}`];
+			}
+		}
+
+		class CursorModeAware implements Component, Focusable {
+			focused = false;
+			useTerminalCursor = false;
+			seenModes: boolean[] = [];
+
+			setUseTerminalCursor(useTerminalCursor: boolean): void {
+				this.useTerminalCursor = useTerminalCursor;
+				this.seenModes.push(useTerminalCursor);
+			}
+
+			invalidate(): void {}
+
+			render(_width: number): string[] {
+				return [this.focused ? `prompt>${CURSOR_MARKER}` : "prompt>"];
+			}
+		}
+
+		class CursorVisibilityTerminal extends VirtualTerminal {
+			visibilityWrites: string[] = [];
+
+			override hideCursor(): void {
+				this.visibilityWrites.push("\x1b[?25l");
+				super.hideCursor();
+			}
+
+			override showCursor(): void {
+				this.visibilityWrites.push(SHOW_CURSOR);
+				super.showCursor();
 			}
 		}
 
@@ -1589,6 +3892,55 @@ describe("TUI terminal-state regressions", () => {
 				}
 			}
 		});
+
+		it("syncs focused component cursor rendering mode on focus and preference changes", () => {
+			const renderScheduler = {
+				now: () => 0,
+				scheduleImmediate: () => {},
+				scheduleRender: () => ({ cancel: () => {} }),
+			};
+			const tui = new TUI(new VirtualTerminal(20, 4), true, { renderScheduler });
+			const first = new CursorModeAware();
+			const second = new CursorModeAware();
+
+			tui.setFocus(first);
+			expect(first.focused).toBe(true);
+			expect(first.useTerminalCursor).toBe(true);
+			expect(first.seenModes).toEqual([true]);
+
+			tui.setShowHardwareCursor(false);
+			expect(first.useTerminalCursor).toBe(false);
+			expect(first.seenModes).toEqual([true, false]);
+
+			tui.setFocus(second);
+			expect(first.focused).toBe(false);
+			expect(second.focused).toBe(true);
+			expect(second.useTerminalCursor).toBe(false);
+			expect(second.seenModes).toEqual([false]);
+
+			tui.setShowHardwareCursor(true);
+			expect(first.useTerminalCursor).toBe(false);
+			expect(second.useTerminalCursor).toBe(true);
+			expect(second.seenModes).toEqual([false, true]);
+		});
+		it("shows the terminal cursor during stop even when paints keep it hidden", async () => {
+			// DECSC/DECRC restore cursor position and attributes, not DECTCEM
+			// visibility. The TUI hides the hardware cursor before paints, so stop()
+			// must explicitly show it even when the session disabled hardware-cursor
+			// rendering and no paint ever emitted \x1b[?25h.
+			const term = new CursorVisibilityTerminal(20, 4);
+			const tui = new TUI(term, false);
+			tui.addChild(new MutableLinesComponent(["prompt"]));
+
+			try {
+				tui.start();
+				await settle(term);
+				expect(term.visibilityWrites).not.toContain(SHOW_CURSOR);
+			} finally {
+				tui.stop();
+			}
+			expect(term.visibilityWrites.at(-1)).toBe(SHOW_CURSOR);
+		});
 	});
 
 	describe("cursor escape sequences stay inside synchronized output blocks", () => {
@@ -1600,6 +3952,25 @@ describe("TUI terminal-state regressions", () => {
 		const DISABLE_AUTOWRAP = "\x1b[?7l";
 		const ENABLE_AUTOWRAP = "\x1b[?7h";
 
+		// Force DEC 2026 synchronized output on regardless of the host terminal so
+		// these wrapper-bracketing assertions stay deterministic. In CI an unknown
+		// TERM disables sync output by default, which would emit no BSU/ESU pairs.
+		const SYNC_ENV: Record<string, string | undefined> = {
+			PI_FORCE_SYNC_OUTPUT: "1",
+			PI_NO_SYNC_OUTPUT: undefined,
+			PI_TUI_SYNC_OUTPUT: undefined,
+		};
+		const savedSyncEnv: Record<string, string | undefined> = {};
+
+		beforeEach(() => {
+			for (const key in SYNC_ENV) {
+				savedSyncEnv[key] = Bun.env[key];
+				const value = SYNC_ENV[key];
+				if (value === undefined) delete Bun.env[key];
+				else Bun.env[key] = value;
+			}
+		});
+
 		function getWrites(term: VirtualTerminal): string[] {
 			const writes: string[] = [];
 			const spy = vi.spyOn(term, "write");
@@ -1610,6 +3981,11 @@ describe("TUI terminal-state regressions", () => {
 		}
 
 		afterEach(() => {
+			for (const key in savedSyncEnv) {
+				const value = savedSyncEnv[key];
+				if (value === undefined) delete Bun.env[key];
+				else Bun.env[key] = value;
+			}
 			vi.restoreAllMocks();
 		});
 
@@ -1773,5 +4149,183 @@ describe("TUI terminal-state regressions", () => {
 				}
 			}
 		}
+	});
+});
+
+describe("foreground-tool streaming on ED3-risk terminals", () => {
+	beforeEach(() => {
+		let monotonicNow = 0;
+		vi.spyOn(performance, "now").mockImplementation(() => {
+			monotonicNow += 20;
+			return monotonicNow;
+		});
+	});
+
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	// Repro of the "injected notification chip renders over the active tool
+	// render" report. A foreground tool (an active `write`) streams on an
+	// ED3-risk terminal (ghostty/kitty/…) whose viewport position is
+	// unobservable. Its header carries a live elapsed-time counter that ticks
+	// every frame; once output scrolls it above the viewport top, each tick is an
+	// OFFSCREEN edit. The agent requests an eager native-scrollback rebuild for
+	// the streaming turn, but that opt-in is gated off on ED3-risk terminals, so
+	// an offscreen-edit-with-growth frame repaints the viewport in place
+	// (`viewportRepaint`) — advancing the rendered line count WITHOUT committing
+	// the new overflow to native history. `#scrollbackHighWater` then lags the
+	// logical viewport top. A later shrink whose changes land in the visible
+	// region finds `naturalViewportTop >= #scrollbackHighWater`, slips past the
+	// shrink-across-boundary guard, and reaches the diff emitter, which anchors to
+	// `#maxLinesRendered - height`: it rewrites only the suffix, drops the newly
+	// exposed top row, and leaves a blank at the bottom — so every row below the
+	// edit renders one row too high, painting over the rows above. The shrink must
+	// instead re-anchor the bottom-anchored viewport.
+	it("re-anchors a visible-region shrink after an offscreen-edit grow lags native history", async () => {
+		await withTerminalRisk(true, async () => {
+			const term = new UnknownViewportTerminal(40, 6);
+			const tui = new TUI(term);
+			// done-* are completed messages that have scrolled into history; the
+			// "Write …s" header carries the ticking timer; code-* is the streamed
+			// preview; loader/todos/editor is the stable footer below the tool.
+			const frameA = [
+				"done-0",
+				"done-1",
+				"done-2",
+				"done-3",
+				"done-4",
+				"done-5",
+				"Write 0s",
+				"code-148",
+				"code-149",
+				"code-150",
+				"loader",
+				"todos",
+				"editor",
+			];
+			const component = new MutableLinesComponent(frameA);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				// Foreground tool active: the agent enables eager native-scrollback rebuild.
+				tui.setEagerNativeScrollbackRebuild(true);
+				await settle(term);
+				// The header has scrolled above the viewport top (offscreen).
+				expect(visible(term)).toEqual(["code-148", "code-149", "code-150", "loader", "todos", "editor"]);
+
+				// Frame B: the offscreen header ticks (0s -> 1s) AND four notification
+				// chips inject between the tool and the footer — an offscreen-edit grow
+				// that repaints in place and lags native history behind the new overflow.
+				const frameB = [
+					"done-0",
+					"done-1",
+					"done-2",
+					"done-3",
+					"done-4",
+					"done-5",
+					"Write 1s",
+					"code-148",
+					"code-149",
+					"code-150",
+					"chip-0",
+					"chip-1",
+					"chip-2",
+					"chip-3",
+					"loader",
+					"todos",
+					"editor",
+				];
+				component.setLines(frameB);
+				tui.requestRender();
+				await term.waitForRender();
+				expect(visible(term)).toEqual(["chip-1", "chip-2", "chip-3", "loader", "todos", "editor"]);
+
+				// Frame C: a visible chip collapses (a shrink whose first change lands in
+				// the visible region) while the header does NOT tick this frame. The
+				// viewport must re-anchor one row up, not drift its content upward.
+				const frameC = [
+					"done-0",
+					"done-1",
+					"done-2",
+					"done-3",
+					"done-4",
+					"done-5",
+					"Write 1s",
+					"code-148",
+					"code-149",
+					"code-150",
+					"chip-0",
+					"chip-1",
+					"chip-2",
+					"loader",
+					"todos",
+					"editor",
+				];
+				component.setLines(frameC);
+				tui.requestRender();
+				await term.waitForRender();
+				expect(visible(term)).toEqual(["chip-0", "chip-1", "chip-2", "loader", "todos", "editor"]);
+			} finally {
+				tui.stop();
+			}
+		});
+	});
+
+	it("honors a clear-scrollback replay queued before the initial paint", async () => {
+		const term = new VirtualTerminal(40, 6);
+		const writes = captureWrites(term);
+		const tui = new TUI(term);
+		tui.addChild(new MutableLinesComponent(["resumed-message", "prompt>"]));
+
+		try {
+			tui.start();
+			tui.requestRender(true, { clearScrollback: true });
+			await settle(term);
+
+			expect(writes.join("")).toContain("\x1b[3J");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	// Repro of the drag-resize line-duplication: dragging the terminal smaller
+	// fires a stream of height shrinks. While the transcript FITS the viewport,
+	// each shrink used to scroll live rows into native scrollback — the in-place
+	// viewport repaint parked the hardware cursor on the padded viewport bottom,
+	// BELOW the short content, so the terminal's shrink reflow pushed the live
+	// rows up to keep that cursor on screen and the next repaint redrew them,
+	// committing one duplicate copy of the visible block per resize step. The
+	// repaint must leave the cursor on the real content bottom instead.
+	it("does not duplicate fitting content into scrollback across a drag-resize", async () => {
+		await withTerminalRisk(true, async () => {
+			const term = new UnknownViewportTerminal(40, 24);
+			const tui = new TUI(term);
+			const body = rows("line-", 4);
+			const component = new MutableLinesComponent(body);
+			tui.addChild(component);
+			try {
+				tui.start();
+				tui.setEagerNativeScrollbackRebuild(true);
+				await settle(term);
+				// A drag-resize: a stream of height shrinks while the 4-line block
+				// keeps fitting the (still larger) viewport.
+				for (const height of [22, 20, 18, 16, 14, 12, 10, 8, 6]) {
+					term.resize(40, height);
+					tui.requestRender();
+					await settle(term);
+				}
+				const scrollback = term.getScrollBuffer();
+				for (let i = 0; i < body.length; i++) {
+					expect(
+						countMatches(scrollback, new RegExp(`\\bline-${i}\\b`)),
+						`line-${i} must not duplicate across resizes`,
+					).toBeLessThanOrEqual(1);
+				}
+			} finally {
+				tui.stop();
+			}
+		});
 	});
 });

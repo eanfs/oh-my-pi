@@ -1,7 +1,8 @@
 import type { InMemorySnapshotStore } from "@oh-my-pi/hashline";
 import type { AgentTelemetryConfig, AgentTool } from "@oh-my-pi/pi-agent-core";
-import type { ToolChoice } from "@oh-my-pi/pi-ai";
-import { $env, $flag, logger } from "@oh-my-pi/pi-utils";
+import type { FetchImpl, ToolChoice } from "@oh-my-pi/pi-ai";
+import { logger } from "@oh-my-pi/pi-utils";
+import type { AsyncJobManager } from "../async/job-manager";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
 import { EditTool } from "../edit";
@@ -10,8 +11,10 @@ import type { Skill } from "../extensibility/skills";
 import type { GoalModeState, GoalRuntime } from "../goals";
 import { GoalTool } from "../goals/tools/goal-tool";
 import type { HindsightSessionState } from "../hindsight/state";
+import type { LocalProtocolOptions } from "../internal-urls";
 import { LspTool } from "../lsp";
-import type { MnemosyneSessionState } from "../mnemosyne/state";
+import type { MCPManager } from "../mcp";
+import type { MnemopiSessionState } from "../mnemopi/state";
 import type { PlanModeState } from "../plan-mode/state";
 import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import type { ArtifactManager } from "../session/artifacts";
@@ -20,6 +23,7 @@ import type { CustomMessage } from "../session/messages";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
 import { TaskTool } from "../task";
 import type { AgentOutputManager } from "../task/output-manager";
+import { countToolsForAutoDiscovery, resolveEffectiveToolDiscoveryMode } from "../tool-discovery/mode";
 import type { DiscoverableTool, DiscoverableToolSearchIndex } from "../tool-discovery/tool-index";
 import type { EventBus } from "../utils/event-bus";
 import { WebSearchTool } from "../web/search";
@@ -32,6 +36,7 @@ import { BrowserTool } from "./browser";
 import { type CheckpointState, CheckpointTool, RewindTool } from "./checkpoint";
 import { DebugTool } from "./debug";
 import { EvalTool } from "./eval";
+import { resolveEvalBackends } from "./eval-backends";
 import { FindTool } from "./find";
 import { GithubTool } from "./gh";
 import { InspectImageTool } from "./inspect-image";
@@ -50,15 +55,11 @@ import { reportFindingTool } from "./review";
 import { SearchTool } from "./search";
 import { SearchToolBm25Tool } from "./search-tool-bm25";
 import { loadSshTool } from "./ssh";
-import { type TodoPhase, TodoWriteTool } from "./todo-write";
+import { type TodoPhase, TodoTool } from "./todo";
 import { WriteTool } from "./write";
 import { YieldTool } from "./yield";
 
-// Exa MCP tools (22 tools)
-
 export * from "../edit";
-export * from "../exa";
-export type * from "../exa/types";
 export * from "../goals";
 export * from "../lsp";
 export * from "../session/streaming-output";
@@ -72,6 +73,7 @@ export * from "./browser";
 export * from "./checkpoint";
 export * from "./debug";
 export * from "./eval";
+export * from "./eval-backends";
 export * from "./find";
 export * from "./gh";
 export * from "./image-gen";
@@ -90,7 +92,7 @@ export * from "./review";
 export * from "./search";
 export * from "./search-tool-bm25";
 export * from "./ssh";
-export * from "./todo-write";
+export * from "./todo";
 export * from "./tts";
 export * from "./write";
 export * from "./yield";
@@ -111,12 +113,37 @@ export type {
 	DiscoverableToolSource,
 } from "../tool-discovery/tool-index";
 
+/**
+ * A late LSP diagnostics result that arrived after the edit/write tool already
+ * returned. Surfaced to the model and the transcript via
+ * {@link ToolSession.queueDeferredDiagnostics}, batched through the session
+ * yield queue like background-job results.
+ */
+export interface DeferredDiagnosticsEntry {
+	/** Absolute path the diagnostics belong to (the renderer shortens it). */
+	path: string;
+	/** One-line severity summary, e.g. "2 errors". */
+	summary: string;
+	/** Formatted, ready-to-display diagnostic lines. */
+	messages: string[];
+	/** True when any message is error severity. */
+	errored: boolean;
+	/**
+	 * Evaluated at injection time (in the dispatcher's stale check): drop the entry
+	 * when a newer mutation to the same file has superseded it, so the model never
+	 * sees diagnostics for stale content.
+	 */
+	isStale(): boolean;
+}
+
 /** Session context for tool factories */
 export interface ToolSession {
 	/** Current working directory */
 	cwd: string;
 	/** Whether UI is available */
 	hasUI: boolean;
+	/** Optional fetch implementation injected into the URL read pipeline (tests, proxies). Defaults to global fetch. */
+	fetch?: FetchImpl;
 	/** Skip Python kernel availability check and warmup */
 	skipPythonPreflight?: boolean;
 	/** Pre-loaded context files (AGENTS.md, etc) */
@@ -153,9 +180,9 @@ export interface ToolSession {
 	getSessionId?: () => string | null;
 	/** Get Hindsight runtime state for this agent session. */
 	getHindsightSessionState?: () => HindsightSessionState | undefined;
-	/** Get Mnemosyne runtime state for this agent session. */
-	getMnemosyneSessionState?: () => MnemosyneSessionState | undefined;
-	/** Agent identity used for IRC routing. Returns the registry id (e.g. "0-Main", "0-AuthLoader"). */
+	/** Get Mnemopi runtime state for this agent session. */
+	getMnemopiSessionState?: () => MnemopiSessionState | undefined;
+	/** Agent identity used for IRC routing. Returns the registry id (e.g. "Main", "AuthLoader"). */
 	getAgentId?: () => string | null;
 	/** Look up a registered tool by name (used by the eval js backend's tool bridge). */
 	getToolByName?: (name: string) => AgentTool | undefined;
@@ -179,14 +206,41 @@ export interface ToolSession {
 	modelRegistry?: import("../config/model-registry").ModelRegistry;
 	/** Agent output manager for unique agent:// IDs across task invocations */
 	agentOutputManager?: AgentOutputManager;
+	/**
+	 * Async job manager scoped to this session.
+	 *
+	 * - Top-level session that constructed one: its own manager.
+	 * - Subagent (`parentTaskPrefix` set): the parent's manager, so background
+	 *   bash/task work and `onJobComplete` deliveries flow into the conversation
+	 *   that spawned it.
+	 * - Secondary in-process top-level session that found a singleton already
+	 *   installed (issue #1923): `undefined`. Tools refuse async work rather
+	 *   than silently route completions into the owning session's `yieldQueue`.
+	 *
+	 * Tools MUST use this instead of `AsyncJobManager.instance()` so a secondary
+	 * session never borrows the owning session's manager by accident.
+	 */
+	asyncJobManager?: AsyncJobManager;
+	/** MCP manager visible to subagents without relying on the process-global singleton. */
+	mcpManager?: MCPManager;
+	/** Local protocol root to propagate to nested subagents and eval-created agents. */
+	localProtocolOptions?: LocalProtocolOptions;
 	/** Settings instance for passing to subagents */
 	settings: Settings;
 	/** Plan mode state (if active) */
 	getPlanModeState?: () => PlanModeState | undefined;
+	/** Path of the session's active plan reference (e.g. `local://<title>.md`); defaults to `local://PLAN.md`. */
+	getPlanReferencePath?: () => string;
 	/** Goal mode state (if active or paused) */
 	getGoalModeState?: () => GoalModeState | undefined;
 	/** Goal runtime for the active agent session. */
 	getGoalRuntime?: () => GoalRuntime | undefined;
+	/** Get cumulative session usage statistics (input/output tokens, cost). */
+	getUsageStatistics?: () => import("../session/session-manager").UsageStatistics;
+	/** Current per-turn token budget {total, spent, hard} for the eval `budget` helper. */
+	getTurnBudget?: () => { total: number | null; spent: number; hard: boolean };
+	/** Record output tokens consumed by an eval-spawned subagent toward the current turn budget. */
+	recordEvalSubagentUsage?: (output: number) => void;
 	/** Bridge to the connected client (e.g. ACP editor host). Tools should route fs/terminal/permission requests through this when available. */
 	getClientBridge?: () => ClientBridge | undefined;
 	/** Get compact conversation context for subagents (excludes tool results, system prompts) */
@@ -245,8 +299,21 @@ export interface ToolSession {
 	 *  by `getConflictHistory`. */
 	conflictHistory?: import("./conflict-detect").ConflictHistory;
 
+	/** Per-session ledger of post-edit LSP diagnostics already surfaced to the
+	 *  model for each file. Lazily initialized by `getDiagnosticsLedger`. */
+	diagnosticsLedger?: import("../lsp/diagnostics-ledger").DiagnosticsLedger;
+
 	/** Queue a hidden message to be injected at the next agent turn. */
 	queueDeferredMessage?(message: CustomMessage): void;
+	/** Queue late LSP diagnostics (arrived after an edit/write returned) to be shown
+	 *  in the transcript and delivered to the model at the next yield, like background
+	 *  job results. */
+	queueDeferredDiagnostics?(entry: DeferredDiagnosticsEntry): void;
+	/** Bump and return the session-global mutation counter for `path`. Edit/write
+	 *  tools call this on every file mutation so stale late-diagnostics can be dropped. */
+	bumpFileMutationVersion?(path: string): number;
+	/** Read the current session-global mutation counter for `path` (0 if never mutated). */
+	getFileMutationVersion?(path: string): number;
 	/** Get the active OpenTelemetry config so subagent dispatch can forward
 	 *  the parent's tracer/hooks with the subagent's own identity stamped. */
 	getTelemetry?: () => AgentTelemetryConfig | undefined;
@@ -271,6 +338,38 @@ export function computeEssentialBuiltinNames(settings: Settings): string[] {
 		return cleaned.filter(name => name in BUILTIN_TOOLS);
 	}
 	return [...DEFAULT_ESSENTIAL_TOOL_NAMES];
+}
+
+/**
+ * Filter the initial active tool set when `tools.discoveryMode === "all"`.
+ *
+ * Non-essential discoverable built-ins are hidden — the model rediscovers them
+ * via `search_tool_bm25` and activates them on demand. A tool survives hiding
+ * when it is essential, explicitly requested, restored from a prior selection,
+ * or required by a forced tool_choice feature (`forceActive`). The last case is
+ * load-bearing: a named tool_choice (e.g. the eager `todo` prelude) must
+ * reference a tool present in the request, or the provider rejects it with 400.
+ */
+export function filterInitialToolsForDiscoveryAll(
+	initialToolNames: string[],
+	opts: {
+		loadModeOf: (name: string) => BuiltinToolLoadMode | undefined;
+		essentialNames: ReadonlySet<string>;
+		explicitlyRequested: ReadonlySet<string>;
+		restored: ReadonlySet<string>;
+		forceActive: ReadonlySet<string>;
+	},
+): string[] {
+	return initialToolNames.filter(name => {
+		const loadMode = opts.loadModeOf(name);
+		if (!loadMode) return true; // not a built-in — leave MCP/custom/extension to existing logic
+		if (loadMode === "essential") return true;
+		if (opts.essentialNames.has(name)) return true;
+		if (opts.explicitlyRequested.has(name)) return true;
+		if (opts.restored.has(name)) return true;
+		if (opts.forceActive.has(name)) return true;
+		return false;
+	});
 }
 
 /**
@@ -299,7 +398,7 @@ export const BUILTIN_TOOLS: Record<string, ToolFactory> = {
 	task: s => TaskTool.create(s),
 	job: JobTool.createIf,
 	irc: IrcTool.createIf,
-	todo_write: s => new TodoWriteTool(s),
+	todo: s => new TodoTool(s),
 	web_search: s => new WebSearchTool(s),
 	search_tool_bm25: SearchToolBm25Tool.createIf,
 	write: s => new WriteTool(s),
@@ -318,42 +417,6 @@ export const HIDDEN_TOOLS: Record<string, ToolFactory> = {
 };
 
 export type ToolName = keyof typeof BUILTIN_TOOLS;
-
-export interface EvalBackendsAllowance {
-	python: boolean;
-	js: boolean;
-}
-
-/**
- * Parse PI_PY / PI_JS environment variables. Each is a boolean flag; unset
- * means "not specified, defer to settings". Returns null when neither is set
- * so the caller can fall through to `readEvalBackendsAllowance` per key.
- */
-function getEvalBackendsFromEnv(): EvalBackendsAllowance | null {
-	const pyEnv = $env.PI_PY;
-	const jsEnv = $env.PI_JS;
-	if (pyEnv === undefined && jsEnv === undefined) return null;
-	return {
-		python: pyEnv === undefined ? true : $flag("PI_PY"),
-		js: jsEnv === undefined ? true : $flag("PI_JS"),
-	};
-}
-
-/** Read per-backend allowance from settings (defaults true). */
-export function readEvalBackendsAllowance(session: ToolSession): EvalBackendsAllowance {
-	return {
-		python: session.settings.get("eval.py") ?? true,
-		js: session.settings.get("eval.js") ?? true,
-	};
-}
-
-/**
- * Materialize the active eval backend allowance: PI_PY / PI_JS env flags
- * override the per-key settings; otherwise settings (defaults true) win.
- */
-export function resolveEvalBackends(session: ToolSession): EvalBackendsAllowance {
-	return getEvalBackendsFromEnv() ?? readEvalBackendsAllowance(session);
-}
 
 /**
  * Create tools from BUILTIN_TOOLS registry.
@@ -413,31 +476,28 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		) {
 			requestedTools.push("ast_edit");
 		}
-		if (["hindsight", "mnemosyne"].includes(session.settings.get("memory.backend") ?? "")) {
+		if (["hindsight", "mnemopi"].includes(session.settings.get("memory.backend") ?? "")) {
 			for (const name of ["recall", "retain", "reflect"]) {
 				if (!requestedTools.includes(name)) requestedTools.push(name);
 			}
 		}
 	}
 	// Resolve effective tool discovery mode.
-	// tools.discoveryMode takes precedence; mcp.discoveryMode is a back-compat alias for "mcp-only".
-	const toolsDiscoveryMode = session.settings.get("tools.discoveryMode");
-	const effectiveDiscoveryMode: "off" | "mcp-only" | "all" =
-		toolsDiscoveryMode !== "off"
-			? (toolsDiscoveryMode as "off" | "mcp-only" | "all")
-			: session.settings.get("mcp.discoveryMode")
-				? "mcp-only"
-				: "off";
+	// tools.discoveryMode controls the new modes; mcp.discoveryMode remains a back-compat alias for "mcp-only".
+	const effectiveDiscoveryMode = resolveEffectiveToolDiscoveryMode(
+		session.settings,
+		countToolsForAutoDiscovery(requestedTools ?? Object.keys(BUILTIN_TOOLS)),
+	);
 	const discoveryActive = effectiveDiscoveryMode !== "off";
 
 	const allTools: Record<string, ToolFactory> = { ...BUILTIN_TOOLS, ...HIDDEN_TOOLS };
 	const isToolAllowed = (name: string) => {
 		if (name === "goal") return goalEnabled && goalModeActive;
 		if (name === "lsp") return enableLsp && session.settings.get("lsp.enabled");
-		if (name === "bash") return true;
+		if (name === "bash") return session.settings.get("bash.enabled");
 		if (name === "eval") return allowEval;
 		if (name === "debug") return session.settings.get("debug.enabled");
-		if (name === "todo_write") return !includeYield && session.settings.get("todo.enabled");
+		if (name === "todo") return !includeYield && session.settings.get("todo.enabled");
 		if (name === "find") return session.settings.get("find.enabled");
 		if (name === "search") return session.settings.get("search.enabled");
 		if (name === "github") return session.settings.get("github.enabled");
@@ -458,7 +518,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 			return true;
 		}
 		if (name === "retain" || name === "recall" || name === "reflect") {
-			return ["hindsight", "mnemosyne"].includes(session.settings.get("memory.backend") ?? "");
+			return ["hindsight", "mnemopi"].includes(session.settings.get("memory.backend") ?? "");
 		}
 		if (name === "task") {
 			const maxDepth = session.settings.get("task.maxRecursionDepth") ?? 2;

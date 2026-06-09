@@ -1,7 +1,7 @@
 {
 	"type": "module",
 	"name": "@oh-my-pi/pi-coding-agent",
-	"version": "15.7.2",
+	"version": "15.10.8",
 	"description": "Coding agent CLI with read, bash, edit, write tools and session management",
 	"homepage": "https://omp.sh",
 	"author": "Can Boluk",
@@ -35,7 +35,7 @@
 		"check": "biome check . && bun run check:types",
 		"check:types": "tsgo -p tsconfig.json --noEmit",
 		"lint": "biome lint .",
-		"test": "bun test",
+		"test": "bun test --parallel",
 		"fix": "biome check --write --unsafe . && bun run format-prompts && bun run generate-docs-index",
 		"fmt": "biome format --write . && bun run format-prompts",
 		"format-prompts": "bun scripts/format-prompts.ts",
@@ -51,10 +51,16 @@
 		"@oh-my-pi/omp-stats": "catalog:",
 		"@oh-my-pi/pi-agent-core": "catalog:",
 		"@oh-my-pi/pi-ai": "catalog:",
-		"@oh-my-pi/pi-mnemosyne": "catalog:",
+		"@oh-my-pi/pi-mnemopi": "catalog:",
 		"@oh-my-pi/pi-natives": "catalog:",
 		"@oh-my-pi/pi-tui": "catalog:",
 		"@oh-my-pi/pi-utils": "catalog:",
+		"@opentelemetry/api": "catalog:",
+		"@opentelemetry/context-async-hooks": "catalog:",
+		"@opentelemetry/exporter-trace-otlp-proto": "catalog:",
+		"@opentelemetry/resources": "catalog:",
+		"@opentelemetry/sdk-trace-base": "catalog:",
+		"@opentelemetry/sdk-trace-node": "catalog:",
 		"@puppeteer/browsers": "catalog:",
 		"@types/turndown": "catalog:",
 		"@xterm/headless": "catalog:",
@@ -126,6 +132,14 @@
 		"./cli/*": {
 			"types": "./src/cli/*.ts",
 			"import": "./src/cli/*.ts"
+		},
+		"./cli/gallery-fixtures": {
+			"types": "./src/cli/gallery-fixtures/index.ts",
+			"import": "./src/cli/gallery-fixtures/index.ts"
+		},
+		"./cli/gallery-fixtures/*": {
+			"types": "./src/cli/gallery-fixtures/*.ts",
+			"import": "./src/cli/gallery-fixtures/*.ts"
 		},
 		"./cli/commands/*": {
 			"types": "./src/cli/commands/*.ts",
@@ -435,6 +449,14 @@
 			"types": "./src/modes/controllers/*.ts",
 			"import": "./src/modes/controllers/*.ts"
 		},
+		"./modes/setup-wizard": {
+			"types": "./src/modes/setup-wizard/index.ts",
+			"import": "./src/modes/setup-wizard/index.ts"
+		},
+		"./modes/setup-wizard/*": {
+			"types": "./src/modes/setup-wizard/*.ts",
+			"import": "./src/modes/setup-wizard/*.ts"
+		},
 		"./modes/rpc/*": {
 			"types": "./src/modes/rpc/*.ts",
 			"import": "./src/modes/rpc/*.ts"
@@ -491,6 +513,10 @@
 		"./task/*": {
 			"types": "./src/task/*.ts",
 			"import": "./src/task/*.ts"
+		},
+		"./tool-discovery/*": {
+			"types": "./src/tool-discovery/*.ts",
+			"import": "./src/tool-discovery/*.ts"
 		},
 		"./tools": {
 			"types": "./src/tools/index.ts",
